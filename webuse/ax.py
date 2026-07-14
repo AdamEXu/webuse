@@ -1,0 +1,265 @@
+"""macOS Accessibility tree access: snapshots, element registry, actions."""
+
+import threading
+import time
+
+from AppKit import NSRunningApplication, NSWorkspace
+from ApplicationServices import (
+    AXIsProcessTrusted,
+    AXUIElementCopyActionNames,
+    AXUIElementCopyAttributeValue,
+    AXUIElementCreateApplication,
+    AXUIElementPerformAction,
+    AXUIElementSetAttributeValue,
+    AXValueGetValue,
+)
+from Quartz import (
+    CGEventCreateMouseEvent,
+    CGPreflightScreenCaptureAccess,
+    CGRequestScreenCaptureAccess,
+    CGEventPost,
+    CGEventPostToPid,
+    CGEventSetIntegerValueField,
+    kCGEventLeftMouseDown,
+    kCGEventLeftMouseUp,
+    kCGHIDEventTap,
+    kCGMouseButtonLeft,
+    kCGMouseEventClickState,
+)
+
+kAXValueCGPointType = 1
+kAXValueCGSizeType = 2
+
+MAX_NODES = 4000
+MAX_TEXT = 50_000
+WALK_BUDGET_S = 4.0
+
+# Per-pid state. AXUIElement supports CFEqual/CFHash across snapshots, so the
+# same on-screen element keeps the same id for the lifetime of the process —
+# agents can cache element references safely. Snapshots run concurrently from the
+# watcher thread and the endpoint threadpool, so all id allocation and lookups go
+# through _id_lock; ids not seen for ID_TTL_S are pruned so long-lived dynamic
+# apps don't grow the maps without bound (recently-seen ids survive refreshes so
+# an agent-held id stays valid for a while after its element scrolls away).
+_id_lock = threading.Lock()
+_counters: dict[int, int] = {}
+_ids_by_el: dict[int, dict] = {}  # pid -> {AXUIElement: id}
+_els_by_id: dict[int, dict] = {}  # pid -> {id: AXUIElement}
+_seen_at: dict[int, dict] = {}  # pid -> {id: monotonic time last walked}
+_last_window: dict[int, dict] = {}
+ID_TTL_S = 120.0
+
+
+def _intern(pid, ids_by_el, els_by_id, seen_at, el, ts) -> str:
+    with _id_lock:
+        node_id = ids_by_el.get(el)
+        if node_id is None:
+            counter = _counters.get(pid, 0) + 1
+            _counters[pid] = counter
+            node_id = f"e{counter}"
+            ids_by_el[el] = node_id
+            els_by_id[node_id] = el
+        seen_at[node_id] = ts
+        return node_id
+
+
+def _prune(pid, ids_by_el, els_by_id, seen_at, now) -> None:
+    with _id_lock:
+        dead = [i for i, t in seen_at.items() if now - t > ID_TTL_S]
+        for i in dead:
+            el = els_by_id.pop(i, None)
+            seen_at.pop(i, None)
+            if el is not None:
+                ids_by_el.pop(el, None)
+
+
+def is_running(pid: int) -> bool:
+    return NSRunningApplication.runningApplicationWithProcessIdentifier_(pid) is not None
+
+
+def forget(pid: int) -> None:
+    """Drop all per-pid state (call when a watched app has exited)."""
+    with _id_lock:
+        for d in (_counters, _ids_by_el, _els_by_id, _seen_at, _last_window):
+            d.pop(pid, None)
+
+
+def trusted() -> bool:
+    return bool(AXIsProcessTrusted())
+
+
+def screen_recording() -> bool:
+    return bool(CGPreflightScreenCaptureAccess())
+
+
+def request_permissions() -> None:
+    """Trigger the system Screen Recording prompt (first time only).
+    Accessibility has no request API — users must grant it in System Settings."""
+    CGRequestScreenCaptureAccess()
+
+
+def list_apps() -> list[dict]:
+    apps = []
+    for a in NSWorkspace.sharedWorkspace().runningApplications():
+        if a.activationPolicy() == 0:  # regular apps (Dock icon)
+            apps.append(
+                {"pid": int(a.processIdentifier()), "name": str(a.localizedName() or "?")}
+            )
+    return sorted(apps, key=lambda a: a["name"].lower())
+
+
+def app_name(pid: int) -> str:
+    a = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+    return str(a.localizedName()) if a else str(pid)
+
+
+def _attr(el, name):
+    err, val = AXUIElementCopyAttributeValue(el, name, None)
+    return val if err == 0 else None
+
+
+def _geom(el):
+    pos, size = _attr(el, "AXPosition"), _attr(el, "AXSize")
+    if pos is None or size is None:
+        return None
+    ok1, p = AXValueGetValue(pos, kAXValueCGPointType, None)
+    ok2, s = AXValueGetValue(size, kAXValueCGSizeType, None)
+    if not (ok1 and ok2):
+        return None
+    return (float(p.x), float(p.y), float(s.width), float(s.height))
+
+
+def _coerce(v):
+    if v is None or isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v[:MAX_TEXT]
+    if isinstance(v, (int, float)):
+        return v
+    s = str(v)
+    return s if len(s) <= 200 else None
+
+
+def snapshot(pid: int) -> dict:
+    """Walk the focused/main window of `pid`. Returns window info + raw nodes,
+    and registers every element so actions can resolve ids later."""
+    app_el = AXUIElementCreateApplication(pid)
+    win = _attr(app_el, "AXFocusedWindow") or _attr(app_el, "AXMainWindow")
+    if win is None:
+        wins = _attr(app_el, "AXWindows")
+        win = wins[0] if wins else None
+    if win is None:
+        raise LookupError(f"no accessible window for pid {pid}")
+
+    wx, wy, ww, wh = _geom(win) or (0.0, 0.0, 800.0, 600.0)
+    window = {
+        "pid": pid,
+        "app": app_name(pid),
+        "title": _coerce(_attr(win, "AXTitle")) or "",
+        "x": wx, "y": wy, "w": ww, "h": wh,
+    }
+    _last_window[pid] = window
+
+    now = time.monotonic()
+    with _id_lock:
+        ids_by_el = _ids_by_el.setdefault(pid, {})
+        els_by_id = _els_by_id.setdefault(pid, {})
+        seen_at = _seen_at.setdefault(pid, {})
+    nodes: list[dict] = []
+    deadline = now + WALK_BUDGET_S
+    truncated = False
+
+    stack = list(_attr(win, "AXChildren") or [])
+    stack.reverse()
+    while stack:
+        if len(nodes) >= MAX_NODES or time.monotonic() > deadline:
+            truncated = True
+            break
+        el = stack.pop()
+        role = _attr(el, "AXRole")
+        if role is None:
+            continue
+        children = _attr(el, "AXChildren")
+        if children:
+            stack.extend(reversed(list(children)))
+        geom = _geom(el)
+        if geom is None:
+            continue
+        err, action_names = AXUIElementCopyActionNames(el, None)
+        actions = [str(a) for a in action_names] if err == 0 and action_names else []
+        node_id = _intern(pid, ids_by_el, els_by_id, seen_at, el, now)
+        title = _coerce(_attr(el, "AXTitle"))
+        desc = _coerce(_attr(el, "AXDescription"))
+        nodes.append(
+            {
+                "id": node_id,
+                "role": str(role),
+                "subrole": _coerce(_attr(el, "AXSubrole")),
+                "label": title or desc or "",
+                "value": _coerce(_attr(el, "AXValue")),
+                "placeholder": _coerce(_attr(el, "AXPlaceholderValue")),
+                "enabled": _attr(el, "AXEnabled") in (None, True, 1),
+                "actions": actions,
+                "x": geom[0], "y": geom[1], "w": geom[2], "h": geom[3],
+            }
+        )
+
+    _prune(pid, ids_by_el, els_by_id, seen_at, now)
+    return {"window": window, "nodes": nodes, "truncated": truncated}
+
+
+def last_window(pid: int) -> dict | None:
+    return _last_window.get(pid)
+
+
+def _lookup(pid: int, el_id: str):
+    with _id_lock:
+        return _els_by_id.get(pid, {}).get(el_id)
+
+
+def perform(pid: int, el_id: str, action: str, value=None) -> dict:
+    el = _lookup(pid, el_id)
+    if el is None:
+        return {"ok": False, "error": f"unknown element id {el_id} (stale snapshot?)"}
+    if action == "press":
+        err = AXUIElementPerformAction(el, "AXPress")
+    elif action == "confirm":
+        err = AXUIElementPerformAction(el, "AXConfirm")
+    elif action == "set_value":
+        AXUIElementSetAttributeValue(el, "AXFocused", True)
+        err = AXUIElementSetAttributeValue(el, "AXValue", "" if value is None else str(value))
+    else:
+        return {"ok": False, "error": f"unknown action {action!r}"}
+    result = {"ok": err == 0, "axerror": int(err)}
+    geom, win = _geom(el), _last_window.get(pid)
+    if geom and win:  # post-action element center, window-relative (for cursors/agents)
+        result["point"] = [
+            round(geom[0] + geom[2] / 2 - win["x"], 1),
+            round(geom[1] + geom[3] / 2 - win["y"], 1),
+        ]
+    return result
+
+
+def click(pid: int, x: float, y: float, activate: bool = False) -> dict:
+    """Synthesize a mouse click at global screen coordinates (points).
+
+    Default: post per-pid events (CGEventPostToPid) — the app receives the
+    click in the background without moving the user's pointer or stealing
+    focus. `activate=True` is the escape hatch for apps that ignore per-pid
+    events: raise the app and post to the system HID tap (takes over the
+    real cursor and focus)."""
+    if activate:
+        app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+        if app:
+            app.activateWithOptions_(1 << 1)  # NSApplicationActivateIgnoringOtherApps
+            time.sleep(0.25)
+    for etype in (kCGEventLeftMouseDown, kCGEventLeftMouseUp):
+        ev = CGEventCreateMouseEvent(None, etype, (x, y), kCGMouseButtonLeft)
+        # Some apps ignore clicks whose clickState is 0.
+        CGEventSetIntegerValueField(ev, kCGMouseEventClickState, 1)
+        if activate:
+            CGEventPost(kCGHIDEventTap, ev)
+        else:
+            CGEventPostToPid(pid, ev)
+        time.sleep(0.04)
+    return {"ok": True, "strategy": "cg-global" if activate else "cg-pid"}
