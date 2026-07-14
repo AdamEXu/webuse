@@ -129,6 +129,20 @@ def _geom(el):
     return (float(p.x), float(p.y), float(s.width), float(s.height))
 
 
+def _far_offscreen(geom, wx, wy, ww, wh) -> bool:
+    """True if `geom` lies more than one window-dimension beyond the visible rect.
+    A tall scroll region (e.g. a playlist with thousands of rows) buries on-screen
+    chrome like a transport bar under a huge off-screen subtree; walking it all
+    exhausts the node/time budget before the chrome is reached. Pruning subtrees
+    this far out keeps the budget for what's visible (plus ~one screen of
+    scroll-ahead in every direction). Case-agnostic: keyed only on geometry."""
+    gx, gy, gw, gh = geom
+    return (
+        gx + gw < wx - ww or gx > wx + 2 * ww
+        or gy + gh < wy - wh or gy > wy + 2 * wh
+    )
+
+
 def _coerce(v):
     if v is None or isinstance(v, bool):
         return v
@@ -179,10 +193,25 @@ def snapshot(pid: int) -> dict:
         role = _attr(el, "AXRole")
         if role is None:
             continue
-        children = _attr(el, "AXChildren")
+        geom = _geom(el)
+        # Skip elements (and their subtrees) buried far outside the visible window:
+        # a tall scroll region's off-screen rows would otherwise drain the walk
+        # budget before on-screen chrome (e.g. a transport bar late in child order)
+        # is reached. On-screen and near-fold content is always kept.
+        if geom is not None and _far_offscreen(geom, wx, wy, ww, wh):
+            continue
+        # Virtualized containers (tables/outlines/lists) can hold hundreds of
+        # scrolled-off rows. Walking only AXVisibleRows — the same signal a
+        # browser agent sees for a virtualized list — keeps the walk budget for
+        # on-screen controls instead of draining it on rows nobody can see.
+        # (Complements _far_offscreen, which never gets a chance to prune rows
+        # this avoids enumerating in the first place.) Falls back to AXChildren.
+        if str(role) in ("AXTable", "AXOutline", "AXList"):
+            children = _attr(el, "AXVisibleRows") or _attr(el, "AXChildren")
+        else:
+            children = _attr(el, "AXChildren")
         if children:
             stack.extend(reversed(list(children)))
-        geom = _geom(el)
         if geom is None:
             continue
         err, action_names = AXUIElementCopyActionNames(el, None)
