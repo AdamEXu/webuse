@@ -68,6 +68,17 @@ def _intern(pid, ids_by_el, els_by_id, seen_at, el, ts) -> str:
         return node_id
 
 
+def register(pid: int, el) -> str:
+    """Intern an element the window walk never reaches (e.g. a menu item) so
+    perform() can resolve it by id. Refreshes its TTL, so a client that re-reads
+    the menu keeps the ids alive."""
+    with _id_lock:
+        ids_by_el = _ids_by_el.setdefault(pid, {})
+        els_by_id = _els_by_id.setdefault(pid, {})
+        seen_at = _seen_at.setdefault(pid, {})
+    return _intern(pid, ids_by_el, els_by_id, seen_at, el, time.monotonic())
+
+
 def _prune(pid, ids_by_el, els_by_id, seen_at, now) -> None:
     with _id_lock:
         dead = [i for i, t in seen_at.items() if now - t > ID_TTL_S]

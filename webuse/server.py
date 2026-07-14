@@ -17,7 +17,7 @@ from fastapi.responses import (
 )
 from pydantic import BaseModel
 
-from . import apps, ax, cursor, dom, watch, workspace
+from . import apps, ax, cursor, dom, menubar, watch, workspace
 from .capture import WindowCapture
 
 TOKEN = os.environ.get("WEBUSE_TOKEN") or secrets.token_urlsafe(12)
@@ -283,6 +283,14 @@ def app_page(pid: int, debug: int = 0):
     )
 
 
+@app.get("/app/{pid}/menu")
+def app_menu(pid: int):
+    try:
+        return {"menu": menubar.read_menu(pid)}
+    except Exception as e:  # a missing/odd menu bar must not break the page
+        return {"menu": [], "error": str(e)}
+
+
 @app.get("/app/{pid}/dom")
 def app_dom(pid: int):
     try:
@@ -426,6 +434,31 @@ body.debug span.ghost { outline-color: rgba(0, 160, 255, .8);
 /* Agent presence (virtual cursor, click pulse, typing indicator) is drawn on
    the real Mac screen by the server, NOT in this page — the browser must never
    fake a cursor. See webuse/cursor.py. */
+/* Web menu bar: the app's real menus, rendered client-side; only the chosen
+   item is sent to the app (as an AXPress). */
+#menubar { display: flex; gap: 1px; background: #f5f5f7; border-bottom: 1px solid #d0d0d0;
+  font: 13px -apple-system, sans-serif; padding: 2px 6px; position: relative; z-index: 20;
+  user-select: none; -webkit-user-select: none; flex-wrap: wrap; }
+#menubar .top { padding: 3px 10px; border-radius: 5px; }
+#menubar .top:hover, #menubar .top.open { background: #dfe0e4; }
+.menu { position: fixed; min-width: 210px; background: #fff; border: 1px solid #c8c8c8;
+  border-radius: 8px; box-shadow: 0 10px 28px rgba(0,0,0,.20); padding: 4px; z-index: 40;
+  font: 13px -apple-system, sans-serif; }
+.menu .item { display: flex; align-items: center; justify-content: space-between; gap: 26px;
+  padding: 4px 10px; border-radius: 5px; white-space: nowrap; }
+.menu .item:not(.disabled):hover { background: #4c8bf5; color: #fff; }
+.menu .item:not(.disabled):hover .sc { color: #fff; }
+.menu .item.disabled { color: #b3b3b3; }
+.menu .sep { height: 1px; background: #e3e3e3; margin: 4px 8px; }
+.menu .lbl { display: flex; gap: 6px; }
+.menu .sc { color: #999; font-size: 12px; }
+.menu .item.sub .sc::after { content: '▸'; }
+@media (prefers-color-scheme: dark) {
+  #menubar { background: #2a2a2c; border-color: #444; color: #eee; }
+  #menubar .top:hover, #menubar .top.open { background: #3a3a3d; }
+  .menu { background: #2c2c2e; border-color: #555; color: #eee; }
+  .menu .sep { background: #444; }
+}
 </style></head>
 <body class="__DEBUG__">
 <div id="agent-note">This page is a live macOS application ("__APP__") rendered as a
@@ -448,6 +481,7 @@ Content updates live; re-read the page after acting.</div>
 <div id="banner"></div>
 <div id="status"></div>
 <button id="focusbtn" type="button">Focus</button>
+<div id="menubar"></div>
 <div id="stage"><img id="screen" src="/app/__PID__/stream" alt="live app screen">
 <div id="overlay"></div></div>
 <div id="offscreen"></div>
@@ -486,6 +520,81 @@ async function act(payload) {
   } catch (e) {}
   setTimeout(refresh, 400);
 }
+
+// ---- Web menu bar: the app's real menus, rendered client-side. Only the
+// chosen item is sent to the app (as an AXPress of its element id). ----
+const menubarEl = document.getElementById('menubar');
+let menuStack = [];    // open .menu divs, outer-first
+let openTop = null;    // the currently-open top-level .top element
+function closeMenus(n) {
+  while (menuStack.length > n) menuStack.pop().remove();
+  if (n === 0 && openTop) { openTop.classList.remove('open'); openTop = null; }
+}
+function buildMenu(items, level, x, y) {
+  closeMenus(level);   // after this, menuStack.length === level
+  const m = document.createElement('div');
+  m.className = 'menu';
+  for (const it of items) {
+    if (it.separator) { const s = document.createElement('div'); s.className = 'sep'; m.appendChild(s); continue; }
+    const el = document.createElement('div');
+    el.className = 'item' + (it.disabled ? ' disabled' : '') + (it.children ? ' sub' : '');
+    const lbl = document.createElement('span'); lbl.className = 'lbl';
+    lbl.textContent = (it.checked ? '\\u2713 ' : '') + it.title;
+    el.appendChild(lbl);
+    if (it.shortcut || it.children) {
+      const sc = document.createElement('span'); sc.className = 'sc'; sc.textContent = it.shortcut || '';
+      el.appendChild(sc);
+    }
+    m.appendChild(el);
+    if (it.disabled) continue;
+    if (it.children) {
+      el.addEventListener('mouseenter', () => {
+        const r = el.getBoundingClientRect();
+        buildMenu(it.children, level + 1, r.right - 5, r.top - 5);
+      });
+    } else {
+      el.addEventListener('mouseenter', () => closeMenus(level + 1));
+      if (it.id) el.addEventListener('click', (e) => {
+        e.stopPropagation(); closeMenus(0); act({id: it.id, action: 'press'});
+      });
+    }
+  }
+  document.body.appendChild(m);
+  const w = m.offsetWidth;
+  if (x + w > window.innerWidth) x = Math.max(2, window.innerWidth - w - 4);
+  m.style.left = x + 'px'; m.style.top = y + 'px';
+  menuStack[level] = m;
+  return m;
+}
+function openTopMenu(topEl, item) {
+  closeMenus(0);
+  topEl.classList.add('open'); openTop = topEl;
+  const r = topEl.getBoundingClientRect();
+  buildMenu(item.children || [], 0, r.left, r.bottom + 2);
+}
+function renderMenubar(tree) {
+  menubarEl.replaceChildren();
+  for (const top of tree) {
+    if (!top.title || !top.children) continue;
+    const t = document.createElement('div'); t.className = 'top'; t.textContent = top.title;
+    t.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (openTop === t) closeMenus(0); else openTopMenu(t, top);
+    });
+    t.addEventListener('mouseenter', () => { if (openTop && openTop !== t) openTopMenu(t, top); });
+    menubarEl.appendChild(t);
+  }
+}
+document.addEventListener('click', () => closeMenus(0));
+async function loadMenu() {
+  if (menuStack.length) return;  // don't rebuild while a menu is open
+  try {
+    const r = await fetch(`/app/${PID}/menu`);
+    if (r.ok) renderMenubar((await r.json()).menu || []);
+  } catch (e) {}
+}
+loadMenu();
+setInterval(loadMenu, 5000);
 
 // Write-guarded setters: never touch the DOM when the value is already right,
 // so agents' cached element refs survive refreshes untouched.
