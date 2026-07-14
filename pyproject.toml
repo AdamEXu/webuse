@@ -10,4 +10,5 @@ dependencies = [
     "pyobjc-framework-quartz>=12.2.1",
     "pyobjc-framework-screencapturekit>=12.2.1",
     "uvicorn>=0.51.0",
+    "websockets>=16.1",
 ]

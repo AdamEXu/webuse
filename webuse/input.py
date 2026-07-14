@@ -121,11 +121,11 @@ def drag(x1: float, y1: float, x2: float, y2: float, button: str = "left") -> No
 
 
 def scroll(gx: float, gy: float, dx: float, dy: float) -> None:
-    """Post a pixel-unit scroll-wheel event at a global point. dy scrolls
-    vertically, dx horizontally (positive dy scrolls content up, matching wheel
-    convention)."""
+    """Post a pixel-unit scroll-wheel event at a global point. Browser wheel
+    deltas are negated so the content moves the same way it does under the
+    trackpad (dragging content up = view scrolls down), matching macOS."""
     ev = CGEventCreateScrollWheelEvent(
-        _SOURCE, kCGScrollEventUnitPixel, 2, int(dy), int(dx)
+        _SOURCE, kCGScrollEventUnitPixel, 2, -int(dy), -int(dx)
     )
     CGEventSetLocation(ev, (gx, gy))
     CGEventPost(kCGHIDEventTap, ev)
@@ -186,6 +186,11 @@ KEYMAP: dict[str, int] = {
     # function row
     "F1": 122, "F2": 120, "F3": 99, "F4": 118, "F5": 96, "F6": 97,
     "F7": 98, "F8": 100, "F9": 101, "F10": 109, "F11": 103, "F12": 111,
+    # modifiers + locks — forwarded as real key down/up (not flags) so the OS
+    # tracks modifier state exactly like a physical keyboard and nothing sticks.
+    "ShiftLeft": 56, "ShiftRight": 60, "ControlLeft": 59, "ControlRight": 62,
+    "AltLeft": 58, "AltRight": 61, "MetaLeft": 55, "MetaRight": 54,
+    "CapsLock": 57, "Fn": 63,
 }
 
 # KeyboardEvent modifier booleans -> CGEventFlags.

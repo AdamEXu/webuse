@@ -6,7 +6,7 @@ import secrets
 import time
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import (
     HTMLResponse,
     JSONResponse,
@@ -449,6 +449,38 @@ def activate(a: Activate):
     return {"ok": True, "pid": a.pid}
 
 
+def _ws_authed(ws: WebSocket) -> bool:
+    tok = ws.query_params.get("token") or ws.cookies.get("webuse_token")
+    if _token_ok(tok):
+        return True
+    client = ws.client.host if ws.client else ""
+    return client in ("127.0.0.1", "::1") and not any(h in ws.headers for h in _PROXY_HEADERS)
+
+
+@app.websocket("/app/{pid}/ws")
+async def app_ws(ws: WebSocket, pid: int):
+    """Low-latency input channel: the page streams compact step messages
+    (move/click/drag/scroll/key…) here instead of one HTTP POST per event. Each
+    is run off the event loop so a drag's sleeps never stall the stream."""
+    if not _ws_authed(ws):
+        await ws.close(code=1008)
+        return
+    await ws.accept()
+    loop = asyncio.get_running_loop()
+    try:
+        while True:
+            msg = await ws.receive_json()
+            try:
+                step = Step(**msg)
+            except Exception:
+                continue
+            await loop.run_in_executor(None, _dispatch, pid, step)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+
+
 @app.post("/api/action")
 def action(a: Action):
     steps = a.actions or (
@@ -585,10 +617,21 @@ const overlay = document.getElementById('overlay');
 const off = document.getElementById('offscreen');
 const stage = document.getElementById('stage');
 
-// Fire-and-forget POST to /api/action. Every interaction (mouse, keyboard, menu)
-// funnels through here; the server turns it into real HID input for the app.
+// Low-latency input over a WebSocket: one persistent connection carries every
+// mouse/keyboard step, instead of an HTTP POST per event. Falls back to POST
+// until the socket is open (and if it drops).
+let ws = null, wsOpen = false;
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/app/${PID}/ws`);
+  ws.onopen = () => { wsOpen = true; };
+  ws.onclose = () => { wsOpen = false; setTimeout(connectWS, 1000); };
+  ws.onerror = () => { try { ws.close(); } catch (e) {} };
+}
+connectWS();
 function send(payload) {
   payload.pid = PID;
+  if (wsOpen && ws.readyState === 1) { try { ws.send(JSON.stringify(payload)); return; } catch (e) {} }
   fetch('/api/action', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(payload),
@@ -800,7 +843,7 @@ stage.addEventListener('mousemove', (ev) => {
   const p = rel(ev);
   if (press) { if (Math.hypot(p.x - press.x, p.y - press.y) > 4) dragged = true; return; }
   const now = performance.now();
-  if (now - hoverAt < 35) return;  // throttle hover
+  if (now - hoverAt < 16) return;  // throttle hover to ~60fps (cheap over WS)
   hoverAt = now;
   send({action: 'move', x: p.x, y: p.y});
 });
@@ -840,20 +883,31 @@ stage.addEventListener('contextmenu', (ev) => {
 // with a visible "captured" badge so the user is never silently trapped. ----
 const kbBadge = document.getElementById('kb');
 kbBadge.addEventListener('click', () => stage.blur());  // click badge to release
+// Forward every key — including modifiers — as a real key down/up by physical
+// code (no modifier flags), so the OS tracks modifier state exactly like a
+// hardware keyboard. Any held key is released on blur/hide so a lost keyup can
+// never leave Shift/Cmd stuck down.
+const held = new Set();
+function releaseHeld() {
+  for (const code of held) send({action: 'key', code, down: false});
+  held.clear();
+}
 stage.addEventListener('focus', () => {
   document.body.classList.add('capturing');
   activateApp();  // raise the app so keystrokes land there
 });
-stage.addEventListener('blur', () => document.body.classList.remove('capturing'));
-function keyMods(ev) { return {shift: ev.shiftKey, ctrl: ev.ctrlKey, alt: ev.altKey, meta: ev.metaKey}; }
+stage.addEventListener('blur', () => { document.body.classList.remove('capturing'); releaseHeld(); });
+window.addEventListener('blur', releaseHeld);
+document.addEventListener('visibilitychange', () => { if (document.hidden) releaseHeld(); });
 stage.addEventListener('keydown', (ev) => {
   ev.preventDefault();  // the app, not the browser, handles it
-  send({action: 'key', code: ev.code, down: true, ...keyMods(ev)});
-  refreshSoon();
+  held.add(ev.code);
+  send({action: 'key', code: ev.code, down: true});
 });
 stage.addEventListener('keyup', (ev) => {
   ev.preventDefault();
-  send({action: 'key', code: ev.code, down: false, ...keyMods(ev)});
+  held.delete(ev.code);
+  send({action: 'key', code: ev.code, down: false});
 });
 
 // Stream resilience: the server closes the MJPEG stream on capture failure or
