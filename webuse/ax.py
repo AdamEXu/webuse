@@ -293,6 +293,59 @@ def perform(pid: int, el_id: str, action: str, value=None) -> dict:
     return result
 
 
+def _scroll_area_at(pid: int, gx: float, gy: float):
+    """Innermost AXScrollArea whose frame contains the global point. Descends the
+    window tree along the containing path rather than hit-testing + walking up
+    AXParent — many apps (e.g. Music) expose a broken parent chain that skips the
+    scroll area. Elements without geometry are traversed but not matched."""
+    app = AXUIElementCreateApplication(pid)
+    win = _attr(app, "AXFocusedWindow") or _attr(app, "AXMainWindow")
+    if win is None:
+        return None
+    best, best_area = None, 0.0
+    stack = [win]
+    while stack:
+        el = stack.pop()
+        g = _geom(el)
+        if g is not None:
+            x, y, w, h = g
+            if not (x <= gx <= x + w and y <= gy <= y + h):
+                continue  # point outside: prune this subtree
+            if str(_attr(el, "AXRole")) == "AXScrollArea" and (best is None or w * h < best_area):
+                best, best_area = el, w * h
+        stack.extend(_attr(el, "AXChildren") or [])
+    return best
+
+
+def _nudge_bar(bar, frac: float) -> bool:
+    v = _attr(bar, "AXValue")
+    if v is None:
+        return False
+    nv = min(1.0, max(0.0, float(v) + frac))
+    if nv == float(v):
+        return False
+    return AXUIElementSetAttributeValue(bar, "AXValue", nv) == 0
+
+
+def scroll(pid: int, gx: float, gy: float, dx: float, dy: float) -> dict:
+    """Scroll the scroll area under global point (gx, gy) by nudging its AX
+    scroll-bar value — pure AX, no event injection, no focus change. The wheel
+    delta (pixels) is mapped to a fraction of the scroll area's height/width.
+    Returns ok False when there's no accessible scroll bar there (the HID-wheel
+    fallback is intentionally omitted — it needs focus-stealing injection)."""
+    area = _scroll_area_at(pid, gx, gy)
+    if area is None:
+        return {"ok": False, "error": "no scroll area at point"}
+    g = _geom(area) or (0.0, 0.0, 1000.0, 800.0)
+    moved = False
+    vbar, hbar = _attr(area, "AXVerticalScrollBar"), _attr(area, "AXHorizontalScrollBar")
+    if vbar is not None and dy:
+        moved |= _nudge_bar(vbar, dy / max(1.0, g[3] * 4))
+    if hbar is not None and dx:
+        moved |= _nudge_bar(hbar, dx / max(1.0, g[2] * 4))
+    return {"ok": moved, "strategy": "ax-scrollbar"}
+
+
 def click(pid: int, x: float, y: float) -> dict:
     """Click at global screen coordinates (points) — the last-resort path for
     bare-pixel targets with no addressable element.

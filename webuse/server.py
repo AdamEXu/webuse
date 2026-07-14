@@ -109,6 +109,8 @@ class Step(BaseModel):
     value: str | None = None
     x: float | None = None
     y: float | None = None
+    dx: float = 0.0  # scroll only: wheel deltas in pixels
+    dy: float = 0.0
     activate: bool = False  # click only: raise the app and use the global HID tap
 
 
@@ -119,6 +121,8 @@ class Action(BaseModel):
     value: str | None = None
     x: float | None = None
     y: float | None = None
+    dx: float = 0.0
+    dy: float = 0.0
     activate: bool = False
     actions: list[Step] | None = None  # batch form: steps run strictly in order
 
@@ -354,6 +358,12 @@ def _dispatch(pid: int, s: Step) -> dict:
             return {"ok": False, "error": "no window or coords"}
         result = ax.click(pid, win["x"] + s.x, win["y"] + s.y)
         result["point"] = [s.x, s.y]
+    elif s.action == "scroll":
+        win = ax.last_window(pid)
+        if win is None or s.x is None or s.y is None:
+            return {"ok": False, "error": "no window or coords"}
+        result = ax.scroll(pid, win["x"] + s.x, win["y"] + s.y, s.dx, s.dy)
+        result["point"] = [s.x, s.y]
     else:
         return {"ok": False, "error": f"unknown action {s.action!r}"}
     # Drive the on-screen agent cursor to where the action landed (global coords).
@@ -366,7 +376,7 @@ def _dispatch(pid: int, s: Step) -> dict:
 @app.post("/api/action")
 def action(a: Action):
     steps = a.actions or (
-        [Step(action=a.action, id=a.id, value=a.value, x=a.x, y=a.y, activate=a.activate)]
+        [Step(action=a.action, id=a.id, value=a.value, x=a.x, y=a.y, dx=a.dx, dy=a.dy, activate=a.activate)]
         if a.action
         else []
     )
@@ -595,6 +605,25 @@ async function loadMenu() {
 }
 loadMenu();
 setInterval(loadMenu, 5000);
+
+// ---- Scroll: a wheel over the stage nudges the app's scroll bar (background AX) ----
+let wheelAccum = {dx: 0, dy: 0}, wheelTimer = null, wheelPt = null;
+stage.addEventListener('wheel', (ev) => {
+  ev.preventDefault();  // don't scroll the browser page
+  const r = screenEl.getBoundingClientRect();
+  wheelPt = {x: ev.clientX - r.left, y: ev.clientY - r.top};
+  wheelAccum.dx += ev.deltaX; wheelAccum.dy += ev.deltaY;
+  if (!wheelTimer) wheelTimer = setTimeout(flushWheel, 55);
+}, {passive: false});
+function flushWheel() {
+  wheelTimer = null;
+  const dx = wheelAccum.dx, dy = wheelAccum.dy;
+  wheelAccum = {dx: 0, dy: 0};
+  if (!wheelPt || (!dx && !dy)) return;
+  fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({pid: PID, action: 'scroll', x: wheelPt.x, y: wheelPt.y, dx, dy})}).catch(() => {});
+  setTimeout(refresh, 150);
+}
 
 // Write-guarded setters: never touch the DOM when the value is already right,
 // so agents' cached element refs survive refreshes untouched.
