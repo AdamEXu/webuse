@@ -14,12 +14,14 @@ from ApplicationServices import (
     AXValueGetValue,
 )
 from Quartz import (
+    CGEventCreate,
     CGEventCreateMouseEvent,
+    CGEventGetLocation,
     CGPreflightScreenCaptureAccess,
     CGRequestScreenCaptureAccess,
     CGEventPost,
-    CGEventPostToPid,
     CGEventSetIntegerValueField,
+    CGWarpMouseCursorPosition,
     kCGEventLeftMouseDown,
     kCGEventLeftMouseUp,
     kCGHIDEventTap,
@@ -31,6 +33,9 @@ kAXValueCGPointType = 1
 kAXValueCGSizeType = 2
 
 MAX_NODES = 4000
+# Above this many children, prefer a container's visible-subset attribute
+# (AXVisibleRows/Cells/Children) over walking every child.
+VISIBLE_SUBSET_MIN = 40
 MAX_TEXT = 50_000
 WALK_BUDGET_S = 4.0
 
@@ -200,16 +205,24 @@ def snapshot(pid: int) -> dict:
         # is reached. On-screen and near-fold content is always kept.
         if geom is not None and _far_offscreen(geom, wx, wy, ww, wh):
             continue
-        # Virtualized containers (tables/outlines/lists) can hold hundreds of
-        # scrolled-off rows. Walking only AXVisibleRows — the same signal a
-        # browser agent sees for a virtualized list — keeps the walk budget for
-        # on-screen controls instead of draining it on rows nobody can see.
-        # (Complements _far_offscreen, which never gets a chance to prune rows
-        # this avoids enumerating in the first place.) Falls back to AXChildren.
-        if str(role) in ("AXTable", "AXOutline", "AXList"):
-            children = _attr(el, "AXVisibleRows") or _attr(el, "AXChildren")
-        else:
-            children = _attr(el, "AXChildren")
+        # Prefer a container's on-screen subset over all its children. Any
+        # heavily populated container that exposes a visible-subset attribute
+        # (tables, outlines, lists, collection/grid views, …) is walked by that
+        # subset only — the same signal a browser agent sees for a virtualized
+        # list — so hundreds of scrolled-off rows never drain the walk budget
+        # before later on-screen controls (e.g. an app's transport bar). Keyed
+        # on child count, not app or role, so it stays general. Complements
+        # _far_offscreen, which can't help here: it must enumerate every row
+        # (an IPC each) before pruning, whereas this never enumerates them.
+        children = _attr(el, "AXChildren")
+        if children and len(children) > VISIBLE_SUBSET_MIN:
+            visible = (
+                _attr(el, "AXVisibleRows")
+                or _attr(el, "AXVisibleCells")
+                or _attr(el, "AXVisibleChildren")
+            )
+            if visible:
+                children = visible
         if children:
             stack.extend(reversed(list(children)))
         if geom is None:
@@ -269,26 +282,27 @@ def perform(pid: int, el_id: str, action: str, value=None) -> dict:
     return result
 
 
-def click(pid: int, x: float, y: float, activate: bool = False) -> dict:
-    """Synthesize a mouse click at global screen coordinates (points).
+def click(pid: int, x: float, y: float) -> dict:
+    """Click at global screen coordinates (points) — the last-resort path for
+    bare-pixel targets with no addressable element.
 
-    Default: post per-pid events (CGEventPostToPid) — the app receives the
-    click in the background without moving the user's pointer or stealing
-    focus. `activate=True` is the escape hatch for apps that ignore per-pid
-    events: raise the app and post to the system HID tap (takes over the
-    real cursor and focus)."""
-    if activate:
-        app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
-        if app:
-            app.activateWithOptions_(1 << 1)  # NSApplicationActivateIgnoringOtherApps
-            time.sleep(0.25)
+    CGEventPostToPid delivers to a pid without moving the pointer, but most apps
+    silently drop synthesized coordinate clicks that carry no real HID telemetry
+    — verified a no-op even on Calculator. The only reliable delivery is to
+    activate the target app and post a genuine HID-tap click, so that's what we
+    do. To keep it from hijacking the user, we snapshot the real pointer first
+    and warp it back afterward, so it just flicks to the target and returns.
+    Addressable controls go through AXPress (background, no focus/pointer
+    change) and never reach here."""
+    saved = CGEventGetLocation(CGEventCreate(None))  # real pointer, to restore
+    app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+    if app:
+        app.activateWithOptions_(1 << 1)  # NSApplicationActivateIgnoringOtherApps
+        time.sleep(0.15)
     for etype in (kCGEventLeftMouseDown, kCGEventLeftMouseUp):
         ev = CGEventCreateMouseEvent(None, etype, (x, y), kCGMouseButtonLeft)
-        # Some apps ignore clicks whose clickState is 0.
-        CGEventSetIntegerValueField(ev, kCGMouseEventClickState, 1)
-        if activate:
-            CGEventPost(kCGHIDEventTap, ev)
-        else:
-            CGEventPostToPid(pid, ev)
+        CGEventSetIntegerValueField(ev, kCGMouseEventClickState, 1)  # some apps ignore clickState 0
+        CGEventPost(kCGHIDEventTap, ev)
         time.sleep(0.04)
-    return {"ok": True, "strategy": "cg-global" if activate else "cg-pid"}
+    CGWarpMouseCursorPosition(saved)  # put the user's pointer back where it was
+    return {"ok": True, "strategy": "focus+hid"}

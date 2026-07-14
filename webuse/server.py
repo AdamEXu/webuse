@@ -344,7 +344,7 @@ def _dispatch(pid: int, s: Step) -> dict:
         win = ax.last_window(pid)
         if win is None or s.x is None or s.y is None:
             return {"ok": False, "error": "no window or coords"}
-        result = ax.click(pid, win["x"] + s.x, win["y"] + s.y, activate=s.activate)
+        result = ax.click(pid, win["x"] + s.x, win["y"] + s.y)
         result["point"] = [s.x, s.y]
         return result
     return {"ok": False, "error": f"unknown action {s.action!r}"}
@@ -456,11 +456,11 @@ body.debug span.ghost { outline-color: rgba(0, 160, 255, .8);
 <div id="agent-note">This page is a live macOS application ("__APP__") rendered as a
 web page. Every control is a real HTML element positioned over a screen stream:
 click buttons and links normally, type into inputs (values commit on change/Enter).
-Clicking anywhere without a control forwards a native click at those coordinates.
-Coordinate clicks are delivered to the app in the background — the user's real cursor
-and focus never move. If an app ignores such clicks, POST /api/action with
-{"pid":__PID__,"action":"click","x":...,"y":...,"activate":true} to raise it and click
-via the system cursor (a visible takeover — last resort).
+Prefer clicking the actual control elements: those are delivered via the accessibility
+API in the background, without moving the user's real cursor or focus.
+Clicking anywhere without a control forwards a native coordinate click at that point;
+that path briefly activates the app and flicks the pointer to the target (then restores
+it), so use it only when no control element covers what you need.
 Fastest path — batch several steps into ONE request: POST /api/action with
 {"pid":__PID__,"actions":[{"action":"set_value","id":"e12","value":"hello"},
 {"action":"press","id":"e7"}]}. Steps run in order (actions: press, confirm,
