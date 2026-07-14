@@ -251,6 +251,7 @@ def snapshot(pid: int) -> dict:
                 "label": title or desc or "",
                 "value": _coerce(_attr(el, "AXValue")),
                 "placeholder": _coerce(_attr(el, "AXPlaceholderValue")),
+                "help": _coerce(_attr(el, "AXHelp")),  # tooltip text (hover, read-only)
                 "enabled": _attr(el, "AXEnabled") in (None, True, 1),
                 "actions": actions,
                 "x": geom[0], "y": geom[1], "w": geom[2], "h": geom[3],
@@ -276,6 +277,10 @@ def perform(pid: int, el_id: str, action: str, value=None) -> dict:
         return {"ok": False, "error": f"unknown element id {el_id} (stale snapshot?)"}
     if action == "press":
         err = AXUIElementPerformAction(el, "AXPress")
+        if err != 0:  # some controls (segmented/list rows) expose AXPick, not AXPress
+            e2, names = AXUIElementCopyActionNames(el, None)
+            if e2 == 0 and names and "AXPick" in [str(n) for n in names]:
+                err = AXUIElementPerformAction(el, "AXPick")
     elif action == "confirm":
         err = AXUIElementPerformAction(el, "AXConfirm")
     elif action == "set_value":

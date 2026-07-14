@@ -58,6 +58,7 @@ def build_nodes(snap: dict) -> list[dict]:
             "w": round(w, 1), "h": round(h, 1),
             "label": n.get("label") or "",
             "placeholder": n.get("placeholder") or "",
+            "help": n.get("help") or "",
             "disabled": not n.get("enabled", True),
             "offscreen": offscreen,
             **info,

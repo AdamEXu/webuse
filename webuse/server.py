@@ -656,7 +656,7 @@ function build(n, e) {
     if (e.textContent !== t) e.textContent = t;
   }
   setAttr(e, 'aria-label', n.label);
-  setAttr(e, 'title', n.label);
+  setAttr(e, 'title', n.help || n.label);  // AXHelp tooltip when present
   setAttr(e, 'placeholder', n.placeholder);
   if (n.tag === 'input' || n.tag === 'button' || n.tag === 'textarea') {
     if (e.disabled !== !!n.disabled) e.disabled = !!n.disabled;
