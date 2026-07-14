@@ -14,19 +14,8 @@ from ApplicationServices import (
     AXValueGetValue,
 )
 from Quartz import (
-    CGEventCreate,
-    CGEventCreateMouseEvent,
-    CGEventGetLocation,
     CGPreflightScreenCaptureAccess,
     CGRequestScreenCaptureAccess,
-    CGEventPost,
-    CGEventSetIntegerValueField,
-    CGWarpMouseCursorPosition,
-    kCGEventLeftMouseDown,
-    kCGEventLeftMouseUp,
-    kCGHIDEventTap,
-    kCGMouseButtonLeft,
-    kCGMouseEventClickState,
 )
 
 kAXValueCGPointType = 1
@@ -271,6 +260,18 @@ def _lookup(pid: int, el_id: str):
         return _els_by_id.get(pid, {}).get(el_id)
 
 
+def center(pid: int, el_id: str) -> tuple[float, float] | None:
+    """Global screen-coordinate center of a registered element (by id), or None.
+    Turns a ghost-DOM id into a real HID click target."""
+    el = _lookup(pid, el_id)
+    if el is None:
+        return None
+    g = _geom(el)
+    if g is None:
+        return None
+    return (g[0] + g[2] / 2.0, g[1] + g[3] / 2.0)
+
+
 def perform(pid: int, el_id: str, action: str, value=None) -> dict:
     el = _lookup(pid, el_id)
     if el is None:
@@ -349,29 +350,3 @@ def scroll(pid: int, gx: float, gy: float, dx: float, dy: float) -> dict:
     if hbar is not None and dx:
         moved |= _nudge_bar(hbar, dx / max(1.0, g[2] * 4))
     return {"ok": moved, "strategy": "ax-scrollbar"}
-
-
-def click(pid: int, x: float, y: float) -> dict:
-    """Click at global screen coordinates (points) — the last-resort path for
-    bare-pixel targets with no addressable element.
-
-    CGEventPostToPid delivers to a pid without moving the pointer, but most apps
-    silently drop synthesized coordinate clicks that carry no real HID telemetry
-    — verified a no-op even on Calculator. The only reliable delivery is to
-    activate the target app and post a genuine HID-tap click, so that's what we
-    do. To keep it from hijacking the user, we snapshot the real pointer first
-    and warp it back afterward, so it just flicks to the target and returns.
-    Addressable controls go through AXPress (background, no focus/pointer
-    change) and never reach here."""
-    saved = CGEventGetLocation(CGEventCreate(None))  # real pointer, to restore
-    app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
-    if app:
-        app.activateWithOptions_(1 << 1)  # NSApplicationActivateIgnoringOtherApps
-        time.sleep(0.15)
-    for etype in (kCGEventLeftMouseDown, kCGEventLeftMouseUp):
-        ev = CGEventCreateMouseEvent(None, etype, (x, y), kCGMouseButtonLeft)
-        CGEventSetIntegerValueField(ev, kCGMouseEventClickState, 1)  # some apps ignore clickState 0
-        CGEventPost(kCGHIDEventTap, ev)
-        time.sleep(0.04)
-    CGWarpMouseCursorPosition(saved)  # put the user's pointer back where it was
-    return {"ok": True, "strategy": "focus+hid"}

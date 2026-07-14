@@ -2,7 +2,6 @@
 
 import asyncio
 import html
-import os
 import secrets
 import time
 from urllib.parse import urlparse
@@ -17,10 +16,10 @@ from fastapi.responses import (
 )
 from pydantic import BaseModel
 
-from . import apps, ax, cursor, dom, menubar, watch, workspace
+from . import apps, ax, config, dom, input, menubar, watch, workspace
 from .capture import WindowCapture
 
-TOKEN = os.environ.get("WEBUSE_TOKEN") or secrets.token_urlsafe(12)
+TOKEN = config.token()  # stable across boots (env / persisted file / generated once)
 
 app = FastAPI(title="webuse")
 
@@ -105,13 +104,21 @@ async def auth(request: Request, call_next):
 
 class Step(BaseModel):
     action: str
-    id: str | None = None
-    value: str | None = None
-    x: float | None = None
+    id: str | None = None  # ghost-DOM element id: its center becomes the target point
+    value: str | None = None  # set_value text, or the literal string for `type`
+    x: float | None = None  # window-relative target (server adds the window origin)
     y: float | None = None
-    dx: float = 0.0  # scroll only: wheel deltas in pixels
+    x2: float | None = None  # drag end point (window-relative)
+    y2: float | None = None
+    dx: float = 0.0  # scroll: wheel deltas in pixels
     dy: float = 0.0
-    activate: bool = False  # click only: raise the app and use the global HID tap
+    code: str | None = None  # key: KeyboardEvent.code (physical, layout-robust)
+    down: bool | None = None  # key: True=down, False=up, None=tap (down+up)
+    shift: bool = False  # key/click modifier flags (KeyboardEvent.*Key)
+    ctrl: bool = False
+    alt: bool = False
+    meta: bool = False
+    activate: bool = False  # raise the app to the foreground before this step
 
 
 class Action(BaseModel):
@@ -121,10 +128,22 @@ class Action(BaseModel):
     value: str | None = None
     x: float | None = None
     y: float | None = None
+    x2: float | None = None
+    y2: float | None = None
     dx: float = 0.0
     dy: float = 0.0
+    code: str | None = None
+    down: bool | None = None
+    shift: bool = False
+    ctrl: bool = False
+    alt: bool = False
+    meta: bool = False
     activate: bool = False
     actions: list[Step] | None = None  # batch form: steps run strictly in order
+
+
+class Activate(BaseModel):
+    pid: int
 
 
 SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_"
@@ -347,36 +366,97 @@ def app_stream(pid: int):
     )
 
 
+def _global_target(pid: int, s: Step) -> tuple[float, float] | None:
+    """Resolve a step's target to GLOBAL screen coords (points): by element id
+    (its center from the last snapshot) or by window-relative x,y (window origin
+    + offset). Every real-input path funnels through here."""
+    if s.id:
+        return ax.center(pid, s.id)  # element geometry is already global
+    win = ax.last_window(pid)
+    if win is None or s.x is None or s.y is None:
+        return None
+    return (win["x"] + s.x, win["y"] + s.y)
+
+
+def _rel_point(pid: int, gx: float, gy: float) -> list[float] | None:
+    win = ax.last_window(pid)
+    return [round(gx - win["x"], 1), round(gy - win["y"], 1)] if win else None
+
+
 def _dispatch(pid: int, s: Step) -> dict:
+    if s.activate:
+        input.activate(pid)
+    # Discovery-side AX actions: the web menu bar presses real menu items (which
+    # live outside the app window and can't be reached by a coordinate click).
     if s.action in ("press", "confirm", "set_value"):
         if not s.id:
             return {"ok": False, "error": "id required"}
-        result = ax.perform(pid, s.id, s.action, s.value)
-    elif s.action == "click":
-        win = ax.last_window(pid)
-        if win is None or s.x is None or s.y is None:
-            return {"ok": False, "error": "no window or coords"}
-        result = ax.click(pid, win["x"] + s.x, win["y"] + s.y)
-        result["point"] = [s.x, s.y]
+        return ax.perform(pid, s.id, s.action, s.value)
+    # Keyboard: real HID keys, addressed by KeyboardEvent.code (+ modifiers).
+    if s.action == "key":
+        code = input.KEYMAP.get(s.code or "")
+        if code is None:
+            return {"ok": False, "error": f"unknown key {s.code!r}"}
+        mods = input.flags_for(_mods(s))
+        if s.down is None:
+            input.key_tap(code, mods)
+        else:
+            input.key(code, mods, s.down)
+        return {"ok": True, "key": s.code}
+    if s.action == "type":
+        if not s.value:
+            return {"ok": False, "error": "value required"}
+        input.type_text(s.value)
+        return {"ok": True}
+    # Everything else targets a point (global coords) via real HID input.
+    g = _global_target(pid, s)
+    if g is None:
+        return {"ok": False, "error": "no window or target"}
+    gx, gy = g
+    if s.action == "click":
+        input.click(gx, gy)
+    elif s.action == "rightclick":
+        input.click(gx, gy, button="right")
+    elif s.action == "dblclick":
+        input.click(gx, gy, count=2)
+    elif s.action == "move":
+        input.move(gx, gy)
     elif s.action == "scroll":
+        input.scroll(gx, gy, s.dx, s.dy)
+    elif s.action == "drag":
         win = ax.last_window(pid)
-        if win is None or s.x is None or s.y is None:
-            return {"ok": False, "error": "no window or coords"}
-        result = ax.scroll(pid, win["x"] + s.x, win["y"] + s.y, s.dx, s.dy)
-        result["point"] = [s.x, s.y]
+        if win is None or s.x2 is None or s.y2 is None:
+            return {"ok": False, "error": "drag needs x2,y2"}
+        input.drag(gx, gy, win["x"] + s.x2, win["y"] + s.y2)
     else:
         return {"ok": False, "error": f"unknown action {s.action!r}"}
-    # Drive the on-screen agent cursor to where the action landed (global coords).
-    win, pt = ax.last_window(pid), result.get("point")
-    if win and pt:
-        cursor.show_action(win["x"] + pt[0], win["y"] + pt[1], s.action)
-    return result
+    out: dict = {"ok": True}
+    pt = _rel_point(pid, gx, gy)
+    if pt:
+        out["point"] = pt
+    return out
+
+
+def _mods(s: Step) -> dict:
+    return {"shiftKey": s.shift, "ctrlKey": s.ctrl, "altKey": s.alt, "metaKey": s.meta}
+
+
+@app.post("/api/activate")
+def activate(a: Activate):
+    """Raise the app to the foreground so HID events reach it. Called on page load
+    (one app at a time) and whenever the stage takes focus."""
+    input.activate(a.pid)
+    return {"ok": True, "pid": a.pid}
 
 
 @app.post("/api/action")
 def action(a: Action):
     steps = a.actions or (
-        [Step(action=a.action, id=a.id, value=a.value, x=a.x, y=a.y, dx=a.dx, dy=a.dy, activate=a.activate)]
+        [Step(
+            action=a.action, id=a.id, value=a.value, x=a.x, y=a.y, x2=a.x2, y2=a.y2,
+            dx=a.dx, dy=a.dy, code=a.code, down=a.down, shift=a.shift, ctrl=a.ctrl,
+            alt=a.alt, meta=a.meta, activate=a.activate,
+        )]
         if a.action
         else []
     )
@@ -413,9 +493,11 @@ APP_PAGE = """<!doctype html>
 <style>
 * { box-sizing: border-box; }
 body { margin: 0; font: 13px -apple-system, sans-serif; }
-#stage { position: relative; overflow: hidden; }
+#stage { position: relative; overflow: hidden; outline: none; touch-action: none; }
 #screen { display: block; position: absolute; left: 0; top: 0; }
-#overlay { position: absolute; left: 0; top: 0; }
+/* The ghost DOM is discovery-only now: every pointer event must reach the stage
+   and forward as real HID input, so the overlay never intercepts the mouse. */
+#overlay { position: absolute; left: 0; top: 0; pointer-events: none; }
 .ghost { position: absolute; margin: 0; padding: 0; border: 0; border-radius: 0;
   background: transparent; color: transparent; caret-color: #111;
   font: 13px -apple-system, sans-serif; text-align: left; cursor: default;
@@ -432,18 +514,18 @@ input.ghost[type=checkbox], input.ghost[type=radio] { opacity: 0.01; }
 body.gone #banner { display: block; }
 #status { display: none; position: fixed; right: 12px; top: 12px; z-index: 10;
   padding: 6px 10px; background: rgba(0,0,0,.75); color: #fff; border-radius: 6px; }
-#focusbtn { position: fixed; left: 12px; top: 12px; z-index: 11; padding: 5px 11px;
-  border: 1px solid var(--accent); border-radius: 6px; background: rgba(255,255,255,.92);
-  color: var(--accent); cursor: pointer; font: 12px -apple-system, sans-serif; }
-body.gone #focusbtn { top: 44px; }
-#focus-footer { padding: 8px 12px; border-top: 1px solid #eee; color: #666; font-size: 12px; }
+/* Keyboard-capture indicator: shown only while the stage has focus, so the user
+   is never silently trapped — click it (or anywhere outside the stage) to release. */
+#kb { display: none; position: fixed; right: 12px; bottom: 12px; z-index: 12;
+  padding: 6px 11px; background: #1a7f37; color: #fff; border-radius: 20px;
+  font: 12px -apple-system, sans-serif; cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,.25); }
+body.capturing #kb { display: block; }
 body.debug .ghost { outline: 1px solid rgba(255, 0, 255, .8);
   background: rgba(255, 0, 255, .06); }
 body.debug span.ghost { outline-color: rgba(0, 160, 255, .8);
   background: rgba(0, 160, 255, .05); }
-/* Agent presence (virtual cursor, click pulse, typing indicator) is drawn on
-   the real Mac screen by the server, NOT in this page — the browser must never
-   fake a cursor. See webuse/cursor.py. */
+/* No in-page cursor: interaction is real HID input, so the actual system cursor
+   moves on the Mac and is captured in the stream. Nothing is faked here. */
 /* Web menu bar: the app's real menus, rendered client-side; only the chosen
    item is sent to the app (as an AXPress). */
 #menubar { display: flex; gap: 1px; background: #f5f5f7; border-bottom: 1px solid #d0d0d0;
@@ -471,64 +553,58 @@ body.debug span.ghost { outline-color: rgba(0, 160, 255, .8);
 }
 </style></head>
 <body class="__DEBUG__">
-<div id="agent-note">This page is a live macOS application ("__APP__") rendered as a
-web page. Every control is a real HTML element positioned over a screen stream:
-click buttons and links normally, type into inputs (values commit on change/Enter).
-Prefer clicking the actual control elements: those are delivered via the accessibility
-API in the background, without moving the user's real cursor or focus.
-Clicking anywhere without a control forwards a native coordinate click at that point;
-that path briefly activates the app and flicks the pointer to the target (then restores
-it), so use it only when no control element covers what you need.
-Fastest path — batch several steps into ONE request: POST /api/action with
-{"pid":__PID__,"actions":[{"action":"set_value","id":"e12","value":"hello"},
-{"action":"press","id":"e7"}]}. Steps run in order (actions: press, confirm,
-set_value with "id"; click with window-relative "x","y"); on failure the response
-has "failed_step". The response always includes per-step "results" (each with
-"point":[x,y] where it landed) and "dom" — the fresh post-action ghost DOM
-({window, truncated, nodes}) — so you can act and observe in one round trip
-instead of re-reading the page.
-Content updates live; re-read the page after acting.</div>
+<div id="agent-note">This page is a live macOS application ("__APP__") shown in the
+FOREGROUND: an MJPEG screen stream with an invisible ghost DOM of HTML elements
+positioned over it. The ghost DOM is for DISCOVERY only — read it to find controls
+and their labels/positions. ALL interaction is real HID input delivered to the app
+(the real cursor moves and the app is focused).
+Drive it via POST /api/action with {"pid":__PID__,...} — one step or "actions":[...]
+run strictly in order. Point-addressed kinds take a ghost-element "id" (its center is
+the target) OR window-relative "x","y": click, rightclick, dblclick, move (hover),
+drag ("x","y" -> "x2","y2"), scroll ("dx","dy" pixels). Keyboard kinds: type
+("value": literal text) and key ("code": a KeyboardEvent.code like "Enter"/"KeyA",
+optional "shift"/"ctrl"/"alt"/"meta", "down": true/false or omit for a tap). The web
+menu bar still presses real menu items over Accessibility (action "press" with an "id").
+Example: {"pid":__PID__,"actions":[{"action":"click","id":"e12"},
+{"action":"type","value":"hello"},{"action":"key","code":"Enter"}]}.
+On failure the response has "failed_step"; it always includes per-step "results"
+(each with "point":[x,y] where it landed) and "dom" — the fresh post-action ghost DOM
+({window, truncated, nodes}) — so you act and observe in one round trip.
+Content updates live; re-read after acting.</div>
 <div id="banner"></div>
 <div id="status"></div>
-<button id="focusbtn" type="button">Focus</button>
+<div id="kb">⌨ keyboard captured — click to release</div>
 <div id="menubar"></div>
-<div id="stage"><img id="screen" src="/app/__PID__/stream" alt="live app screen">
+<div id="stage" tabindex="0"><img id="screen" src="/app/__PID__/stream" alt="live app screen" draggable="false">
 <div id="overlay"></div></div>
 <div id="offscreen"></div>
-<footer id="focus-footer"><strong>If clicks don't go through for some actions, it might be a focus issue. Try focusing the window then performing the action.</strong></footer>
 <script>
 const PID = __PID__;
-// Raise + activate this app's native window (reuses the workspace focus endpoint).
-// Helps when background coordinate clicks are ignored because the app isn't focused.
-document.getElementById('focusbtn').addEventListener('click', () => {
-  fetch('/api/workspace/focus', {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({pid: PID}),
-  }).catch(() => {});
-});
 const screenEl = document.getElementById('screen');
 const overlay = document.getElementById('overlay');
 const off = document.getElementById('offscreen');
 const stage = document.getElementById('stage');
 
-function typing() {
-  const a = document.activeElement;
-  return a && a.classList.contains('ghost') &&
-    (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA');
-}
-
-async function act(payload) {
+// Fire-and-forget POST to /api/action. Every interaction (mouse, keyboard, menu)
+// funnels through here; the server turns it into real HID input for the app.
+function send(payload) {
   payload.pid = PID;
-  // Fire-and-observe. Agent presence (cursor/pulse) is rendered on the real
-  // screen by the server from this same action — nothing is drawn in-page.
-  try {
-    await fetch('/api/action', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(payload),
-    });
-  } catch (e) {}
-  setTimeout(refresh, 400);
+  fetch('/api/action', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload),
+  }).catch(() => {});
+}
+let refreshTimer = null;
+function refreshSoon() { clearTimeout(refreshTimer); refreshTimer = setTimeout(refresh, 250); }
+// Menu bar still drives real menu items over Accessibility; then re-read the DOM.
+function act(payload) { send(payload); refreshSoon(); }
+
+// Raise the app to the foreground (one app at a time) so HID events reach it.
+function activateApp() {
+  fetch('/api/activate', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({pid: PID}),
+  }).catch(() => {});
 }
 
 // ---- Web menu bar: the app's real menus, rendered client-side. Only the
@@ -606,12 +682,11 @@ async function loadMenu() {
 loadMenu();
 setInterval(loadMenu, 5000);
 
-// ---- Scroll: a wheel over the stage nudges the app's scroll bar (background AX) ----
+// ---- Scroll: a wheel over the stage posts a real HID scroll at that point ----
 let wheelAccum = {dx: 0, dy: 0}, wheelTimer = null, wheelPt = null;
 stage.addEventListener('wheel', (ev) => {
   ev.preventDefault();  // don't scroll the browser page
-  const r = screenEl.getBoundingClientRect();
-  wheelPt = {x: ev.clientX - r.left, y: ev.clientY - r.top};
+  wheelPt = rel(ev);
   wheelAccum.dx += ev.deltaX; wheelAccum.dy += ev.deltaY;
   if (!wheelTimer) wheelTimer = setTimeout(flushWheel, 55);
 }, {passive: false});
@@ -620,9 +695,8 @@ function flushWheel() {
   const dx = wheelAccum.dx, dy = wheelAccum.dy;
   wheelAccum = {dx: 0, dy: 0};
   if (!wheelPt || (!dx && !dy)) return;
-  fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({pid: PID, action: 'scroll', x: wheelPt.x, y: wheelPt.y, dx, dy})}).catch(() => {});
-  setTimeout(refresh, 150);
+  send({action: 'scroll', x: wheelPt.x, y: wheelPt.y, dx, dy});
+  refreshSoon();
 }
 
 // Write-guarded setters: never touch the DOM when the value is already right,
@@ -705,39 +779,81 @@ function render(d) {
 }
 
 async function refresh() {
-  if (typing()) return;
   try {
     const r = await fetch(`/app/${PID}/dom`);
     if (r.ok) render(await r.json());
   } catch (e) {}
 }
 
-function onClick(ev) {
-  const t = ev.target.closest('[data-ax-id]');
-  if (!t) return;
-  if (t.dataset.kind === 'text') return; // allow focus for typing
-  ev.preventDefault();
-  act({id: t.dataset.axId, action: 'press'});
+// ---- Mouse: forward every pointer event on the stage as real HID input.
+// Coords are window-relative (the server adds the window origin -> global). ----
+function rel(ev) {
+  const r = screenEl.getBoundingClientRect();
+  return {x: ev.clientX - r.left, y: ev.clientY - r.top};
 }
-overlay.addEventListener('click', onClick);
-off.addEventListener('click', onClick);
+let hoverAt = 0;         // last hover post (throttle)
+let press = null;        // {x,y} where the left button went down, while held
+let dragged = false;     // moved past the drag threshold while pressed
+let swallowClick = false; // suppress the click that trails a completed drag
 
-overlay.addEventListener('change', (ev) => {
-  const t = ev.target;
-  if (t.dataset && t.dataset.kind === 'text') {
-    act({id: t.dataset.axId, action: 'set_value', value: t.value});
+stage.addEventListener('mousemove', (ev) => {
+  const p = rel(ev);
+  if (press) { if (Math.hypot(p.x - press.x, p.y - press.y) > 4) dragged = true; return; }
+  const now = performance.now();
+  if (now - hoverAt < 35) return;  // throttle hover
+  hoverAt = now;
+  send({action: 'move', x: p.x, y: p.y});
+});
+stage.addEventListener('mousedown', (ev) => {
+  if (ev.button === 0) { press = rel(ev); dragged = false; swallowClick = false; }
+});
+stage.addEventListener('mouseup', (ev) => {
+  if (ev.button !== 0 || !press) return;
+  if (dragged) {  // press-drag-release becomes one real drag gesture
+    const p = rel(ev);
+    send({action: 'drag', x: press.x, y: press.y, x2: p.x, y2: p.y});
+    swallowClick = true;
+    refreshSoon();
   }
+  press = null; dragged = false;
+});
+stage.addEventListener('click', (ev) => {
+  if (swallowClick) { swallowClick = false; return; }
+  if (ev.detail > 1) return;  // 2nd/3rd of a multi-click; dblclick handles doubles
+  const p = rel(ev);
+  send({action: 'click', x: p.x, y: p.y});
+  refreshSoon();
+});
+stage.addEventListener('dblclick', (ev) => {
+  const p = rel(ev);
+  send({action: 'dblclick', x: p.x, y: p.y});
+  refreshSoon();
+});
+stage.addEventListener('contextmenu', (ev) => {
+  ev.preventDefault();
+  const p = rel(ev);
+  send({action: 'rightclick', x: p.x, y: p.y});
+  refreshSoon();
 });
 
-overlay.addEventListener('keydown', (ev) => {
-  const t = ev.target;
-  if (ev.key === 'Enter' && t.dataset && t.dataset.kind === 'text' &&
-      t.tagName === 'INPUT') {
-    ev.preventDefault();
-    act({id: t.dataset.axId, action: 'set_value', value: t.value});
-    setTimeout(() => act({id: t.dataset.axId, action: 'confirm'}), 200);
-    t.blur();
-  }
+// ---- Keyboard: forward keys as real HID, but only while the stage has focus,
+// with a visible "captured" badge so the user is never silently trapped. ----
+const kbBadge = document.getElementById('kb');
+kbBadge.addEventListener('click', () => stage.blur());  // click badge to release
+stage.addEventListener('focus', () => {
+  document.body.classList.add('capturing');
+  activateApp();  // raise the app so keystrokes land there
+});
+stage.addEventListener('blur', () => document.body.classList.remove('capturing'));
+function keyMods(ev) { return {shift: ev.shiftKey, ctrl: ev.ctrlKey, alt: ev.altKey, meta: ev.metaKey}; }
+stage.addEventListener('keydown', (ev) => {
+  ev.preventDefault();  // the app, not the browser, handles it
+  send({action: 'key', code: ev.code, down: true, ...keyMods(ev)});
+  refreshSoon();
+});
+stage.addEventListener('keyup', (ev) => {
+  ev.preventDefault();
+  send({action: 'key', code: ev.code, down: false, ...keyMods(ev)});
 });
 
 // Stream resilience: the server closes the MJPEG stream on capture failure or
@@ -754,18 +870,14 @@ function restartStream() {
 screenEl.addEventListener('error', () => setTimeout(restartStream, 500));
 screenEl.addEventListener('load', () => { statusEl.style.display = 'none'; });
 
-screenEl.addEventListener('click', (ev) => {
-  const r = screenEl.getBoundingClientRect();
-  act({action: 'click', x: ev.clientX - r.left, y: ev.clientY - r.top});
-});
-
+activateApp();  // one app at a time: raise it to the foreground on page load
 refresh(); // initial paint / fallback; live updates arrive over SSE below
 
 const banner = document.getElementById('banner');
 const es = new EventSource(`/app/${PID}/events`); // auto-reconnects on error
 es.onmessage = (ev) => {
   document.body.classList.remove('gone');
-  if (!typing()) render(JSON.parse(ev.data));
+  render(JSON.parse(ev.data));
 };
 es.addEventListener('gone', (ev) => {
   banner.textContent = 'App unavailable: ' + (JSON.parse(ev.data).error || 'window gone');
