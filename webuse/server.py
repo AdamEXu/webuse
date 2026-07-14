@@ -17,7 +17,7 @@ from fastapi.responses import (
 )
 from pydantic import BaseModel
 
-from . import apps, ax, dom, watch, workspace
+from . import apps, ax, cursor, dom, watch, workspace
 from .capture import WindowCapture
 
 TOKEN = os.environ.get("WEBUSE_TOKEN") or secrets.token_urlsafe(12)
@@ -339,15 +339,20 @@ def _dispatch(pid: int, s: Step) -> dict:
     if s.action in ("press", "confirm", "set_value"):
         if not s.id:
             return {"ok": False, "error": "id required"}
-        return ax.perform(pid, s.id, s.action, s.value)
-    if s.action == "click":
+        result = ax.perform(pid, s.id, s.action, s.value)
+    elif s.action == "click":
         win = ax.last_window(pid)
         if win is None or s.x is None or s.y is None:
             return {"ok": False, "error": "no window or coords"}
         result = ax.click(pid, win["x"] + s.x, win["y"] + s.y)
         result["point"] = [s.x, s.y]
-        return result
-    return {"ok": False, "error": f"unknown action {s.action!r}"}
+    else:
+        return {"ok": False, "error": f"unknown action {s.action!r}"}
+    # Drive the on-screen agent cursor to where the action landed (global coords).
+    win, pt = ax.last_window(pid), result.get("point")
+    if win and pt:
+        cursor.show_action(win["x"] + pt[0], win["y"] + pt[1], s.action)
+    return result
 
 
 @app.post("/api/action")
@@ -418,39 +423,9 @@ body.debug .ghost { outline: 1px solid rgba(255, 0, 255, .8);
   background: rgba(255, 0, 255, .06); }
 body.debug span.ghost { outline-color: rgba(0, 160, 255, .8);
   background: rgba(0, 160, 255, .05); }
-/* Agent presence: virtual cursor, action pulses, typing chip, toast feed.
-   All pointer-events:none and outside #overlay — never intercepts clicks,
-   never mutates ghost elements. */
-:root { --accent: #4c8bf5; }
-#cursor { position: absolute; width: 18px; height: 18px; color: var(--accent);
-  pointer-events: none; z-index: 10; opacity: 0;
-  transition: left .28s cubic-bezier(.3,.7,.3,1), top .28s cubic-bezier(.3,.7,.3,1),
-    opacity .2s; }
-#cursor.thinking { animation: wiggle 1.6s ease-in-out infinite; }
-@keyframes wiggle {
-  0%, 100% { transform: translate(0, 0) rotate(0deg); }
-  25% { transform: translate(2px, -1px) rotate(2deg); }
-  50% { transform: translate(-1px, 2px) rotate(-2deg); }
-  75% { transform: translate(1px, 1px) rotate(1deg); }
-}
-.ripple { position: absolute; width: 26px; height: 26px; border-radius: 50%;
-  border: 2px solid var(--accent); background: color-mix(in srgb, var(--accent) 25%, transparent);
-  pointer-events: none; z-index: 9; transform: translate(-50%, -50%) scale(0);
-  animation: pulse .45s ease-out forwards; }
-@keyframes pulse {
-  from { transform: translate(-50%, -50%) scale(0); opacity: 1; }
-  to { transform: translate(-50%, -50%) scale(2.2); opacity: 0; }
-}
-.chip { position: absolute; padding: 3px 8px; border-radius: 5px;
-  background: var(--accent); color: #fff; font-size: 12px; white-space: nowrap;
-  pointer-events: none; z-index: 10; opacity: 1; transition: opacity .4s; }
-#feed { position: fixed; right: 12px; top: 44px; z-index: 10; display: flex;
-  flex-direction: column; align-items: flex-end; gap: 6px; pointer-events: none; }
-.toast { padding: 5px 10px; border-radius: 6px; background: rgba(0,0,0,.72);
-  color: #fff; font-size: 12px; max-width: 320px; overflow: hidden;
-  white-space: nowrap; text-overflow: ellipsis;
-  border-left: 3px solid var(--accent); opacity: 1; transition: opacity .5s; }
-.chip.fade, .toast.fade { opacity: 0; }
+/* Agent presence (virtual cursor, click pulse, typing indicator) is drawn on
+   the real Mac screen by the server, NOT in this page — the browser must never
+   fake a cursor. See webuse/cursor.py. */
 </style></head>
 <body class="__DEBUG__">
 <div id="agent-note">This page is a live macOS application ("__APP__") rendered as a
@@ -473,12 +448,8 @@ Content updates live; re-read the page after acting.</div>
 <div id="banner"></div>
 <div id="status"></div>
 <button id="focusbtn" type="button">Focus</button>
-<div id="feed"></div>
 <div id="stage"><img id="screen" src="/app/__PID__/stream" alt="live app screen">
-<div id="overlay"></div>
-<div id="cursor"><svg width="18" height="18" viewBox="0 0 18 18"><path
-  d="M1 1 L1 14.5 L4.7 11.3 L7 16.5 L9.4 15.4 L7.1 10.3 L12 10.3 Z"
-  fill="currentColor" stroke="#fff" stroke-width="1"/></svg></div></div>
+<div id="overlay"></div></div>
 <div id="offscreen"></div>
 <footer id="focus-footer"><strong>If clicks don't go through for some actions, it might be a focus issue. Try focusing the window then performing the action.</strong></footer>
 <script>
@@ -502,91 +473,17 @@ function typing() {
     (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA');
 }
 
-// Agent presence: virtual cursor glides to each action, pulses on press,
-// shows typed text in a chip, and logs a toast — pure spectator chrome.
-const cursor = document.getElementById('cursor');
-const feed = document.getElementById('feed');
-const accent = new URLSearchParams(location.search).get('accent') || '';
-if (/^[0-9a-f]{3,8}$/i.test(accent))
-  document.documentElement.style.setProperty('--accent', '#' + accent);
-else if (/^[a-z]+$/i.test(accent))
-  document.documentElement.style.setProperty('--accent', accent);
-
-let idleTimer = null;
-function agentCursor(x, y, kind, detail) {
-  cursor.classList.remove('thinking');
-  cursor.style.opacity = '1';
-  cursor.style.left = x + 'px';
-  cursor.style.top = y + 'px';
-  clearTimeout(idleTimer);
-  idleTimer = setTimeout(() => cursor.classList.add('thinking'), 2000);
-  if (kind === 'set_value' && detail) // ripples land later, at the server-reported point
-    setTimeout(() => chip(x, y, detail), 300); // once the .28s glide lands
-}
-function ripple(x, y) {
-  const r = document.createElement('div');
-  r.className = 'ripple';
-  r.style.left = x + 'px'; r.style.top = y + 'px';
-  stage.appendChild(r);
-  r.addEventListener('animationend', () => r.remove());
-}
-function chip(x, y, text) {
-  const c = document.createElement('div');
-  c.className = 'chip';
-  c.textContent = text.length > 24 ? text.slice(0, 24) + '…' : text;
-  c.style.left = (x + 20) + 'px'; c.style.top = (y + 14) + 'px';
-  stage.appendChild(c);
-  setTimeout(() => c.classList.add('fade'), 1200);
-  c.addEventListener('transitionend', () => c.remove());
-}
-function toast(kind, label) {
-  const t = document.createElement('div');
-  t.className = 'toast';
-  t.textContent = label ? kind + ' — \\u201c' + label + '\\u201d' : kind;
-  feed.prepend(t);
-  while (feed.children.length > 5) feed.lastChild.remove();
-  setTimeout(() => t.classList.add('fade'), 3000);
-  t.addEventListener('transitionend', () => t.remove());
-}
-function announce(p) {
-  let x, y, label = '';
-  if (p.id != null) {
-    const el = document.querySelector('[data-ax-id="' + CSS.escape(p.id) + '"]');
-    if (el) {
-      label = el.getAttribute('aria-label') || el.textContent || el.value || '';
-      if (el.parentElement === overlay) {
-        x = el.offsetLeft + el.offsetWidth / 2;
-        y = el.offsetTop + el.offsetHeight / 2;
-      }
-    }
-  } else if (p.x != null && p.y != null) { x = p.x; y = p.y; }
-  if (x != null) agentCursor(x, y, p.action, p.value);
-  toast(p.action, p.action === 'set_value' ? (p.value || '') : label);
-  return x != null ? [x, y] : null;
-}
-
 async function act(payload) {
   payload.pid = PID;
-  const estimate = announce(payload);
-  let point = null;
+  // Fire-and-observe. Agent presence (cursor/pulse) is rendered on the real
+  // screen by the server from this same action — nothing is drawn in-page.
   try {
-    const r = await fetch('/api/action', {
+    await fetch('/api/action', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(payload),
     });
-    if (r.ok) { // server reports where each step landed; place the ripple exactly there
-      const j = await r.json();
-      point = (j.results && j.results[0] && j.results[0].point) || null;
-    }
   } catch (e) {}
-  if (payload.action !== 'set_value') {
-    const p = point || estimate;
-    if (p) {
-      cursor.style.left = p[0] + 'px'; cursor.style.top = p[1] + 'px';
-      ripple(p[0], p[1]);
-    }
-  }
   setTimeout(refresh, 400);
 }
 
