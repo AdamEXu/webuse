@@ -458,13 +458,20 @@ async def app_stream_ws(ws: WebSocket, handle: str):
 
     cap = WindowCapture(pid, target_frame=frame(), get_frame=frame, window_id=window_id)
     gen = cap.jpegs()
-    # A stream socket only ever pushes frames; the client never sends. So a
-    # graceful close (close frame) can't surface on the send path — and an abrupt
-    # drop makes the transport log "socket.send() raised exception" per frame
-    # without raising to us. Watch receive() concurrently: it raises on disconnect,
-    # letting us stop the loop AND close the generator so no frame is produced for
-    # a dead socket.
+    # LATEST-FRAME-WINS. Capture into a single slot; a separate sender ships only
+    # the freshest frame. Under a slow link (the tunnel), send_bytes backpressures,
+    # the producer keeps overwriting the slot, and the intermediate frames are
+    # DROPPED — so on moving video latency stays ~one frame instead of a backlog
+    # that grows without bound. (TCP delivers everything in order and never drops,
+    # so we must avoid generating the backlog ourselves.)
+    #
+    # A stream socket only ever pushes; the client never sends. An abrupt drop makes
+    # the transport log "socket.send() raised exception" per frame without raising
+    # to us, so a receive() watcher is the reliable disconnect signal — it also
+    # lets us stop capturing so no frame is produced for a dead socket.
     gone = asyncio.Event()
+    ready = asyncio.Event()
+    slot = {"jpg": None}
 
     async def _watch_close():
         try:
@@ -474,20 +481,39 @@ async def app_stream_ws(ws: WebSocket, handle: str):
             pass
         finally:
             gone.set()
+            ready.set()  # wake the sender so it exits
+
+    async def _produce():
+        try:
+            async for jpg in gen:
+                if gone.is_set():
+                    break
+                slot["jpg"] = jpg  # overwrite — only the newest frame survives
+                ready.set()
+        except Exception:
+            pass
+        finally:
+            gone.set()
+            ready.set()
 
     watcher = asyncio.create_task(_watch_close())
+    producer = asyncio.create_task(_produce())
     try:
-        async for jpg in gen:
-            if gone.is_set():
-                break
+        while not gone.is_set():
+            await ready.wait()
+            ready.clear()
+            jpg, slot["jpg"] = slot["jpg"], None
+            if jpg is None:
+                continue
             try:
-                await ws.send_bytes(jpg)
+                await ws.send_bytes(jpg)  # backpressure here => drops pile up in the slot
             except Exception:
-                break  # client went away; stop sending and stop capturing
-    except Exception:
-        pass
+                break
     finally:
+        gone.set()
         watcher.cancel()
+        producer.cancel()
+        await asyncio.gather(producer, watcher, return_exceptions=True)
         await gen.aclose()  # stop pulling capture frames for a dead socket
 
 
