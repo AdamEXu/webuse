@@ -458,30 +458,18 @@ async def app_stream_ws(ws: WebSocket, handle: str):
 
     cap = WindowCapture(pid, target_frame=frame(), get_frame=frame, window_id=window_id)
     gen = cap.jpegs()
-    # LATEST-FRAME-WINS. Capture into a single slot; a separate sender ships only
-    # the freshest frame. Under a slow link (the tunnel), send_bytes backpressures,
-    # the producer keeps overwriting the slot, and the intermediate frames are
-    # DROPPED — so on moving video latency stays ~one frame instead of a backlog
-    # that grows without bound. (TCP delivers everything in order and never drops,
-    # so we must avoid generating the backlog ourselves.)
-    #
-    # A stream socket only ever pushes; the client never sends. An abrupt drop makes
-    # the transport log "socket.send() raised exception" per frame without raising
-    # to us, so a receive() watcher is the reliable disconnect signal — it also
-    # lets us stop capturing so no frame is produced for a dead socket.
+    # CLIENT-PACED PULL. A background producer keeps a single latest-frame slot
+    # fresh; we send a frame ONLY when the client asks for the next (it pings after
+    # rendering each frame). That caps in-flight at one frame, so a slow link can
+    # never build a backlog — each request is answered with the FRESHEST captured
+    # frame and whatever was captured in between is silently dropped. (TCP never
+    # drops and can buffer without bound, so push pacing lets latency grow on
+    # moving video; pull pacing fixes it regardless of transport buffering.) The
+    # client's ping doubles as the disconnect signal: ws.receive() raises when it
+    # goes away, letting us stop capturing for a dead socket.
     gone = asyncio.Event()
-    ready = asyncio.Event()
+    fresh = asyncio.Event()
     slot = {"jpg": None}
-
-    async def _watch_close():
-        try:
-            while True:
-                await ws.receive()
-        except Exception:
-            pass
-        finally:
-            gone.set()
-            ready.set()  # wake the sender so it exits
 
     async def _produce():
         try:
@@ -489,31 +477,37 @@ async def app_stream_ws(ws: WebSocket, handle: str):
                 if gone.is_set():
                     break
                 slot["jpg"] = jpg  # overwrite — only the newest frame survives
-                ready.set()
+                fresh.set()
         except Exception:
             pass
         finally:
             gone.set()
-            ready.set()
+            fresh.set()
 
-    watcher = asyncio.create_task(_watch_close())
     producer = asyncio.create_task(_produce())
     try:
-        while not gone.is_set():
-            await ready.wait()
-            ready.clear()
-            jpg, slot["jpg"] = slot["jpg"], None
-            if jpg is None:
-                continue
+        while True:
             try:
-                await ws.send_bytes(jpg)  # backpressure here => drops pile up in the slot
+                await ws.receive()  # client "ready" ping (also raises on disconnect)
+            except Exception:
+                break
+            if gone.is_set():
+                break
+            while slot["jpg"] is None and not gone.is_set():  # await a frame (<=~1/fps)
+                fresh.clear()
+                if slot["jpg"] is None:
+                    await fresh.wait()
+            if gone.is_set():
+                break
+            jpg, slot["jpg"] = slot["jpg"], None
+            try:
+                await ws.send_bytes(jpg)
             except Exception:
                 break
     finally:
         gone.set()
-        watcher.cancel()
         producer.cancel()
-        await asyncio.gather(producer, watcher, return_exceptions=True)
+        await asyncio.gather(producer, return_exceptions=True)
         await gen.aclose()  # stop pulling capture frames for a dead socket
 
 
@@ -1136,9 +1130,23 @@ kbBadge.addEventListener('click', () => stage.blur());  // click badge to releas
 // hardware keyboard. Any held key is released on blur/hide so a lost keyup can
 // never leave Shift/Cmd stuck down.
 const held = new Set();
+// Keep the Mac's modifier state in lockstep with the browser's ACTUAL modifier
+// state on every event. Every KeyboardEvent reports the true shift/ctrl/alt/meta
+// state; if a keyup was ever lost (a browser/OS shortcut swallowed it, focus
+// flicked away), the next keystroke reveals the truth and we correct it — so a
+// modifier can never stay stuck down. Modifiers are driven ONLY through here.
+const MOD = {shiftKey: 'ShiftLeft', ctrlKey: 'ControlLeft', altKey: 'AltLeft', metaKey: 'MetaLeft'};
+const modDown = {shiftKey: false, ctrlKey: false, altKey: false, metaKey: false};
+const isMod = (code) => /^(Shift|Control|Alt|Meta)(Left|Right)$/.test(code);
+function syncMods(ev) {
+  for (const k in MOD) {
+    if (ev[k] !== modDown[k]) { send({action: 'key', code: MOD[k], down: ev[k]}); modDown[k] = ev[k]; }
+  }
+}
 function releaseHeld() {
   for (const code of held) send({action: 'key', code, down: false});
   held.clear();
+  for (const k in MOD) if (modDown[k]) { send({action: 'key', code: MOD[k], down: false}); modDown[k] = false; }
 }
 stage.addEventListener('focus', () => {
   document.body.classList.add('capturing');
@@ -1149,13 +1157,17 @@ window.addEventListener('blur', releaseHeld);
 document.addEventListener('visibilitychange', () => { if (document.hidden) releaseHeld(); });
 stage.addEventListener('keydown', (ev) => {
   ev.preventDefault();  // the app, not the browser, handles it
+  syncMods(ev);                    // correct modifier state first (self-heals lost keyups)
+  if (isMod(ev.code)) return;      // the modifier itself is delivered by syncMods
   held.add(ev.code);
   send({action: 'key', code: ev.code, down: true});
 });
 stage.addEventListener('keyup', (ev) => {
   ev.preventDefault();
+  if (isMod(ev.code)) { syncMods(ev); return; }  // its release is delivered by syncMods
   held.delete(ev.code);
   send({action: 'key', code: ev.code, down: false});
+  syncMods(ev);
 });
 
 // Stream transport. The page starts on MJPEG (the <img> src set server-side) and
@@ -1176,6 +1188,7 @@ function connectStreamWS() {
   catch (e) { return; }
   sock.binaryType = 'blob';
   streamWS = sock;
+  sock.onopen = () => { try { sock.send('n'); } catch (e) {} };  // pull the first frame
   sock.onmessage = (ev) => {
     wsFrames = true;
     const url = URL.createObjectURL(ev.data);
@@ -1201,8 +1214,18 @@ function restartStream() {
   clearTimeout(statusTimer);
   statusTimer = setTimeout(() => { statusEl.style.display = 'none'; }, 2000);
 }
-screenEl.addEventListener('error', () => setTimeout(restartStream, 500));
-screenEl.addEventListener('load', () => { statusEl.style.display = 'none'; });
+// Client-paced pull: request the next frame only AFTER this one has rendered (or
+// failed), so the server never outruns our display+network rate — no backlog.
+function pullNext() {
+  if (streamWS && streamWS.readyState === 1 && wsFrames) {
+    try { streamWS.send('n'); } catch (e) {}
+  }
+}
+screenEl.addEventListener('load', () => { statusEl.style.display = 'none'; pullNext(); });
+screenEl.addEventListener('error', () => {
+  if (wsFrames) { pullNext(); return; }   // skip a bad WS frame, keep the pull going
+  setTimeout(restartStream, 500);          // MJPEG failure -> reconnect
+});
 connectStreamWS();
 
 // ---- Left sidebar: running apps (icon + name), each expandable to its windows.
