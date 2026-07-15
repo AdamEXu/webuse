@@ -12,11 +12,12 @@ from fastapi.responses import (
     JSONResponse,
     PlainTextResponse,
     RedirectResponse,
+    Response,
     StreamingResponse,
 )
 from pydantic import BaseModel
 
-from . import apps, ax, config, dom, input, menubar, watch, workspace
+from . import apps, ax, config, dom, input, menubar, watch, windows, workspace
 from .capture import WindowCapture
 
 TOKEN = config.token()  # stable across boots (env / persisted file / generated once)
@@ -64,7 +65,7 @@ def _token_ok(supplied: str | None) -> bool:
     return supplied is not None and secrets.compare_digest(supplied, TOKEN)
 
 
-def _same_origin(request: Request) -> bool:
+def _same_origin(request: "Request | WebSocket") -> bool:
     """Reject browser cross-site requests so a malicious page can't drive the
     local server via /api/action (which otherwise skips the token for localhost).
     Trust Sec-Fetch-Site when present; else compare the Origin host to Host.
@@ -123,6 +124,7 @@ class Step(BaseModel):
 
 class Action(BaseModel):
     pid: int
+    window_id: int | None = None  # which window to target; None => focused/main
     action: str | None = None  # single-step form (back-compat)
     id: str | None = None
     value: str | None = None
@@ -144,6 +146,7 @@ class Action(BaseModel):
 
 class Activate(BaseModel):
     pid: int
+    window_id: int | None = None
 
 
 SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_"
@@ -298,26 +301,73 @@ def permissions_request():
     return {"trusted": ax.trusted(), "screen_recording": ax.screen_recording()}
 
 
-@app.get("/app/{pid}", response_class=HTMLResponse)
-def app_page(pid: int, debug: int = 0):
+def _parse(handle: str) -> tuple[int, int | None]:
+    """'pid' or 'pid.winid' -> (pid, window_id|None). Raises ValueError on junk."""
+    return windows.parse_handle(handle)
+
+
+@app.get("/app/{handle}", response_class=HTMLResponse)
+def app_page(handle: str, debug: int = 0):
+    try:
+        pid, window_id = _parse(handle)
+    except ValueError:
+        return HTMLResponse("bad app handle", status_code=400)
     name = html.escape(ax.app_name(pid))
-    return APP_PAGE.replace("__PID__", str(pid)).replace("__APP__", name).replace(
-        "__DEBUG__", "debug" if debug else ""
+    return (
+        APP_PAGE.replace("__PID__", str(pid))
+        .replace("__HANDLE__", windows.format_handle(pid, window_id))
+        .replace("__WINDOW_ID__", "null" if window_id is None else str(window_id))
+        .replace("__APP__", name)
+        .replace("__DEBUG__", "debug" if debug else "")
     )
 
 
-@app.get("/app/{pid}/menu")
-def app_menu(pid: int):
+@app.get("/app/{handle}/windows")
+def app_windows(handle: str):
+    """The app's windows, so the client can offer per-window navigation."""
+    try:
+        pid, _ = _parse(handle)
+    except ValueError:
+        return JSONResponse({"error": "bad app handle"}, status_code=400)
+    return {"pid": pid, "windows": windows.list_windows(pid)}
+
+
+@app.get("/app/{handle}/icon")
+def app_icon(handle: str):
+    """The app's icon as a PNG (app-level; window_id in the handle is ignored)."""
+    try:
+        pid, _ = _parse(handle)
+    except ValueError:
+        return PlainTextResponse("bad app handle", status_code=400)
+    png = apps.icon_png(pid)
+    if png is None:
+        return PlainTextResponse("no icon", status_code=404)
+    return Response(
+        content=png, media_type="image/png",
+        headers={"Cache-Control": "public, max-age=300"},
+    )
+
+
+@app.get("/app/{handle}/menu")
+def app_menu(handle: str):
+    try:
+        pid, _ = _parse(handle)
+    except ValueError:
+        return JSONResponse({"menu": [], "error": "bad app handle"}, status_code=400)
     try:
         return {"menu": menubar.read_menu(pid)}
     except Exception as e:  # a missing/odd menu bar must not break the page
         return {"menu": [], "error": str(e)}
 
 
-@app.get("/app/{pid}/dom")
-def app_dom(pid: int):
+@app.get("/app/{handle}/dom")
+def app_dom(handle: str):
     try:
-        snap = ax.snapshot(pid)
+        pid, window_id = _parse(handle)
+    except ValueError:
+        return JSONResponse({"error": "bad app handle"}, status_code=400)
+    try:
+        snap = ax.snapshot(pid, window_id)
     except LookupError as e:
         return JSONResponse({"error": str(e)}, status_code=404)
     return {
@@ -333,9 +383,10 @@ def _sse(item: tuple[str | None, str]) -> str:
     return f"{prefix}data: {payload}\n\n"
 
 
-@app.get("/app/{pid}/events")
-async def app_events(pid: int):
-    watcher, q = watch.subscribe(pid, asyncio.get_running_loop())
+@app.get("/app/{handle}/events")
+async def app_events(handle: str):
+    pid, window_id = _parse(handle)
+    watcher, q = watch.subscribe(pid, asyncio.get_running_loop(), window_id)
 
     async def gen():
         try:
@@ -354,44 +405,78 @@ async def app_events(pid: int):
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
-@app.get("/app/{pid}/stream")
-def app_stream(pid: int):
+@app.get("/app/{handle}/stream")
+def app_stream(handle: str):
+    pid, window_id = _parse(handle)
+
     def frame():  # stays fresh: the DOM watcher re-snapshots on AXWindowMoved/Resized
-        w = ax.last_window(pid)
+        w = ax.last_window(pid, window_id)
         return (w["x"], w["y"], w["w"], w["h"]) if w else None
 
-    cap = WindowCapture(pid, target_frame=frame(), get_frame=frame)
+    cap = WindowCapture(pid, target_frame=frame(), get_frame=frame, window_id=window_id)
     return StreamingResponse(
         cap.mjpeg(), media_type="multipart/x-mixed-replace; boundary=frame"
     )
 
 
-def _global_target(pid: int, s: Step) -> tuple[float, float] | None:
+@app.websocket("/app/{handle}/stream_ws")
+async def app_stream_ws(ws: WebSocket, handle: str):
+    """Lower-latency screen transport: push each captured JPEG as a binary frame as
+    soon as it's ready (the page swaps it onto the <img> via a Blob URL), instead of
+    the MJPEG multipart stream. The client keeps the MJPEG endpoint as a fallback, so
+    if this socket never opens (or drops) nothing regresses. The handle fixes which
+    window is captured, exactly like /stream."""
+    if not _ws_authed(ws):
+        await ws.close(code=1008)
+        return
+    try:
+        pid, window_id = _parse(handle)
+    except ValueError:
+        await ws.close(code=1008)
+        return
+    await ws.accept()
+
+    def frame():
+        w = ax.last_window(pid, window_id)
+        return (w["x"], w["y"], w["w"], w["h"]) if w else None
+
+    cap = WindowCapture(pid, target_frame=frame(), get_frame=frame, window_id=window_id)
+    try:
+        async for jpg in cap.jpegs():
+            await ws.send_bytes(jpg)
+    except (WebSocketDisconnect, RuntimeError):
+        pass  # client went away (send after disconnect raises RuntimeError)
+    except Exception:
+        pass
+
+
+def _global_target(pid: int, s: Step, window_id: int | None) -> tuple[float, float] | None:
     """Resolve a step's target to GLOBAL screen coords (points): by element id
     (its center from the last snapshot) or by window-relative x,y (window origin
     + offset). Every real-input path funnels through here."""
     if s.id:
-        return ax.center(pid, s.id)  # element geometry is already global
-    win = ax.last_window(pid)
+        return ax.center(pid, s.id, window_id)  # element geometry is already global
+    win = ax.last_window(pid, window_id)
     if win is None or s.x is None or s.y is None:
         return None
     return (win["x"] + s.x, win["y"] + s.y)
 
 
-def _rel_point(pid: int, gx: float, gy: float) -> list[float] | None:
-    win = ax.last_window(pid)
+def _rel_point(pid: int, gx: float, gy: float, window_id: int | None) -> list[float] | None:
+    win = ax.last_window(pid, window_id)
     return [round(gx - win["x"], 1), round(gy - win["y"], 1)] if win else None
 
 
-def _dispatch(pid: int, s: Step) -> dict:
+def _dispatch(pid: int, s: Step, window_id: int | None = None) -> dict:
     if s.activate:
         input.activate(pid)
+        windows.raise_window(pid, window_id)  # raise the addressed window, if any
     # Discovery-side AX actions: the web menu bar presses real menu items (which
     # live outside the app window and can't be reached by a coordinate click).
     if s.action in ("press", "confirm", "set_value"):
         if not s.id:
             return {"ok": False, "error": "id required"}
-        return ax.perform(pid, s.id, s.action, s.value)
+        return ax.perform(pid, s.id, s.action, s.value, window_id)
     # Keyboard: real HID keys, addressed by KeyboardEvent.code (+ modifiers).
     if s.action == "key":
         code = input.KEYMAP.get(s.code or "")
@@ -409,7 +494,7 @@ def _dispatch(pid: int, s: Step) -> dict:
         input.type_text(s.value)
         return {"ok": True}
     # Everything else targets a point (global coords) via real HID input.
-    g = _global_target(pid, s)
+    g = _global_target(pid, s, window_id)
     if g is None:
         return {"ok": False, "error": "no window or target"}
     gx, gy = g
@@ -424,14 +509,14 @@ def _dispatch(pid: int, s: Step) -> dict:
     elif s.action == "scroll":
         input.scroll(gx, gy, s.dx, s.dy)
     elif s.action == "drag":
-        win = ax.last_window(pid)
+        win = ax.last_window(pid, window_id)
         if win is None or s.x2 is None or s.y2 is None:
             return {"ok": False, "error": "drag needs x2,y2"}
         input.drag(gx, gy, win["x"] + s.x2, win["y"] + s.y2)
     else:
         return {"ok": False, "error": f"unknown action {s.action!r}"}
     out: dict = {"ok": True}
-    pt = _rel_point(pid, gx, gy)
+    pt = _rel_point(pid, gx, gy, window_id)
     if pt:
         out["point"] = pt
     return out
@@ -443,10 +528,12 @@ def _mods(s: Step) -> dict:
 
 @app.post("/api/activate")
 def activate(a: Activate):
-    """Raise the app to the foreground so HID events reach it. Called on page load
-    (one app at a time) and whenever the stage takes focus."""
+    """Raise the app to the foreground so HID events reach it, and (if a window is
+    addressed) raise that window. Called on page load (one app at a time) and
+    whenever the stage takes focus."""
     input.activate(a.pid)
-    return {"ok": True, "pid": a.pid}
+    windows.raise_window(a.pid, a.window_id)
+    return {"ok": True, "pid": a.pid, "window_id": a.window_id}
 
 
 def _ws_authed(ws: WebSocket) -> bool:
@@ -454,15 +541,26 @@ def _ws_authed(ws: WebSocket) -> bool:
     if _token_ok(tok):
         return True
     client = ws.client.host if ws.client else ""
-    return client in ("127.0.0.1", "::1") and not any(h in ws.headers for h in _PROXY_HEADERS)
+    if client not in ("127.0.0.1", "::1") or any(h in ws.headers for h in _PROXY_HEADERS):
+        return False
+    # Browsers don't apply CORS to WebSockets, so a loopback socket alone can't prove
+    # same-site: any page the victim visits could open ws://127.0.0.1 and inject HID or
+    # read the stream. Require same-origin (mirrors _same_origin) to block that.
+    return _same_origin(ws)
 
 
-@app.websocket("/app/{pid}/ws")
-async def app_ws(ws: WebSocket, pid: int):
+@app.websocket("/app/{handle}/ws")
+async def app_ws(ws: WebSocket, handle: str):
     """Low-latency input channel: the page streams compact step messages
     (move/click/drag/scroll/key…) here instead of one HTTP POST per event. Each
-    is run off the event loop so a drag's sleeps never stall the stream."""
+    is run off the event loop so a drag's sleeps never stall the stream. The
+    handle fixes which window every step targets."""
     if not _ws_authed(ws):
+        await ws.close(code=1008)
+        return
+    try:
+        pid, window_id = _parse(handle)
+    except ValueError:
         await ws.close(code=1008)
         return
     await ws.accept()
@@ -474,7 +572,7 @@ async def app_ws(ws: WebSocket, pid: int):
                 step = Step(**msg)
             except Exception:
                 continue
-            await loop.run_in_executor(None, _dispatch, pid, step)
+            await loop.run_in_executor(None, _dispatch, pid, step, window_id)
     except WebSocketDisconnect:
         pass
     except Exception:
@@ -498,17 +596,17 @@ def action(a: Action):
     for i, s in enumerate(steps):
         if i:
             time.sleep(0.08)  # let the app react between steps
-        r = _dispatch(a.pid, s)
+        r = _dispatch(a.pid, s, a.window_id)
         results.append(r)
         if not r.get("ok"):
             break  # stop at the first failure; its index = len(results) - 1
-    watch.kick(a.pid)  # push a fresh ghost DOM to SSE clients right away
+    watch.kick(a.pid, a.window_id)  # push a fresh ghost DOM to SSE clients right away
     ok = all(r.get("ok") for r in results)
     out: dict = {"ok": ok, "results": results}
     if not ok:
         out["failed_step"] = len(results) - 1
     try:  # inline post-action DOM so agents skip the observe round trip
-        snap = ax.snapshot(a.pid)
+        snap = ax.snapshot(a.pid, a.window_id)
         out["dom"] = {
             "window": snap["window"],
             "truncated": snap["truncated"],
@@ -524,9 +622,49 @@ APP_PAGE = """<!doctype html>
 <html><head><meta charset="utf-8"><title>__APP__</title>
 <style>
 * { box-sizing: border-box; }
+html, body { height: 100%; }
 body { margin: 0; font: 13px -apple-system, sans-serif; }
-#stage { position: relative; overflow: hidden; outline: none; touch-action: none; }
+/* App shell: persistent left sidebar + main column (menu bar over the stage). */
+#shell { display: flex; height: 100vh; }
+#sidebar { flex: 0 0 210px; width: 210px; overflow-y: auto; background: #f5f5f7;
+  border-right: 1px solid #d0d0d0; user-select: none; -webkit-user-select: none; }
+#sb-home { display: block; padding: 8px 12px; color: #4c8bf5; text-decoration: none;
+  font-weight: 600; border-bottom: 1px solid #e2e2e5; position: sticky; top: 0;
+  background: #f5f5f7; z-index: 1; }
+#sb-home:hover { background: #ececef; }
+.sb-approw { display: flex; align-items: center; gap: 6px; padding: 5px 8px; cursor: pointer;
+  white-space: nowrap; overflow: hidden; }
+.sb-approw:hover { background: #ececef; }
+.sb-approw.current { background: #e4edff; }
+.sb-caret { width: 12px; flex: 0 0 12px; text-align: center; color: #999; font-size: 10px; }
+.sb-icon { width: 18px; height: 18px; flex: 0 0 18px; border-radius: 4px; }
+.sb-name { overflow: hidden; text-overflow: ellipsis; }
+.sb-wins { padding-left: 4px; }
+.sb-win { display: block; padding: 4px 8px 4px 34px; color: #333; text-decoration: none;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 12px; }
+.sb-win:hover { background: #ececef; }
+.sb-win.current { background: #4c8bf5; color: #fff; }
+.sb-win.min { opacity: .55; font-style: italic; }
+.sb-empty { padding: 4px 8px 4px 34px; color: #aaa; font-size: 12px; }
+#main { flex: 1 1 auto; min-width: 0; min-height: 0; display: flex; flex-direction: column;
+  overflow: hidden; }
+/* Fit the streamed feed into the area left of the sidebar / below the menu bar. */
+#stagewrap { flex: 1 1 auto; min-width: 0; min-height: 0; display: flex;
+  align-items: center; justify-content: center; overflow: hidden; background: #111; }
+/* #stagebox is the on-screen (scaled) footprint; #stage keeps native window points
+   and is shrunk into it with a CSS transform, so the ghost overlay stays aligned. */
+#stagebox { position: relative; overflow: hidden; }
+#stage { position: absolute; left: 0; top: 0; transform-origin: top left;
+  overflow: hidden; outline: none; touch-action: none; }
 #screen { display: block; position: absolute; left: 0; top: 0; }
+@media (prefers-color-scheme: dark) {
+  #sidebar { background: #1e1e20; border-color: #3a3a3d; }
+  #sb-home { background: #1e1e20; border-color: #333; }
+  #sb-home:hover, .sb-approw:hover, .sb-win:hover { background: #2a2a2d; }
+  .sb-approw.current { background: #2b3a5e; }
+  .sb-win { color: #ccc; }
+  .sb-empty { color: #666; }
+}
 /* The ghost DOM is discovery-only now: every pointer event must reach the stage
    and forward as real HID input, so the overlay never intercepts the mouse. */
 #overlay { position: absolute; left: 0; top: 0; pointer-events: none; }
@@ -590,8 +728,8 @@ FOREGROUND: an MJPEG screen stream with an invisible ghost DOM of HTML elements
 positioned over it. The ghost DOM is for DISCOVERY only — read it to find controls
 and their labels/positions. ALL interaction is real HID input delivered to the app
 (the real cursor moves and the app is focused).
-Drive it via POST /api/action with {"pid":__PID__,...} — one step or "actions":[...]
-run strictly in order. Point-addressed kinds take a ghost-element "id" (its center is
+Drive it via POST /api/action with {"pid":__PID__,"window_id":__WINDOW_ID__,...} — one
+step or "actions":[...] run strictly in order (window_id null targets the focused window). Point-addressed kinds take a ghost-element "id" (its center is
 the target) OR window-relative "x","y": click, rightclick, dblclick, move (hover),
 drag ("x","y" -> "x2","y2"), scroll ("dx","dy" pixels). Keyboard kinds: type
 ("value": literal text) and key ("code": a KeyboardEvent.code like "Enter"/"KeyA",
@@ -606,16 +744,44 @@ Content updates live; re-read after acting.</div>
 <div id="banner"></div>
 <div id="status"></div>
 <div id="kb">⌨ keyboard captured — click to release</div>
+<div id="shell">
+<aside id="sidebar"><a id="sb-home" href="/">← webuse</a><div id="sb-apps"></div></aside>
+<main id="main">
 <div id="menubar"></div>
-<div id="stage" tabindex="0"><img id="screen" src="/app/__PID__/stream" alt="live app screen" draggable="false">
-<div id="overlay"></div></div>
+<div id="stagewrap"><div id="stagebox"><div id="stage" tabindex="0"><img id="screen" src="/app/__HANDLE__/stream" alt="live app screen" draggable="false">
+<div id="overlay"></div></div></div></div>
+</main>
+</div>
 <div id="offscreen"></div>
 <script>
 const PID = __PID__;
+const HANDLE = "__HANDLE__";      // pid or pid.winid — which window this page drives
+const WINDOW_ID = __WINDOW_ID__;  // null (focused window) or a specific CGWindowID
 const screenEl = document.getElementById('screen');
 const overlay = document.getElementById('overlay');
 const off = document.getElementById('offscreen');
 const stage = document.getElementById('stage');
+const stagewrap = document.getElementById('stagewrap');
+const stagebox = document.getElementById('stagebox');
+
+// ---- Responsive feed scaling: shrink the native-sized stage (window points) to
+// fit the area left of the sidebar / below the menu bar, preserving aspect via the
+// more-constraining axis, never enlarging (scale <= 1). The whole #stage is scaled
+// with one CSS transform, so the ghost overlay (native coords inside it) stays
+// pixel-aligned with the streamed frame. rel() divides displayed offsets by `scale`
+// to recover true window points before any input is sent. ----
+let winW = 0, winH = 0, scale = 1;
+function applyScale() {
+  if (!winW || !winH) return;
+  const availW = stagewrap.clientWidth, availH = stagewrap.clientHeight;
+  if (availW < 1 || availH < 1) return;
+  scale = Math.min(availW / winW, availH / winH, 1);
+  setStyle(stage, 'width', winW + 'px'); setStyle(stage, 'height', winH + 'px');
+  setStyle(stage, 'transform', 'scale(' + scale + ')');
+  setStyle(stagebox, 'width', (winW * scale) + 'px');
+  setStyle(stagebox, 'height', (winH * scale) + 'px');
+}
+window.addEventListener('resize', applyScale);
 
 // Low-latency input over a WebSocket: one persistent connection carries every
 // mouse/keyboard step, instead of an HTTP POST per event. Falls back to POST
@@ -623,7 +789,7 @@ const stage = document.getElementById('stage');
 let ws = null, wsOpen = false;
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/app/${PID}/ws`);
+  ws = new WebSocket(`${proto}://${location.host}/app/${HANDLE}/ws`);
   ws.onopen = () => { wsOpen = true; };
   ws.onclose = () => { wsOpen = false; setTimeout(connectWS, 1000); };
   ws.onerror = () => { try { ws.close(); } catch (e) {} };
@@ -631,6 +797,7 @@ function connectWS() {
 connectWS();
 function send(payload) {
   payload.pid = PID;
+  if (WINDOW_ID !== null && payload.window_id === undefined) payload.window_id = WINDOW_ID;
   if (wsOpen && ws.readyState === 1) { try { ws.send(JSON.stringify(payload)); return; } catch (e) {} }
   fetch('/api/action', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -646,7 +813,7 @@ function act(payload) { send(payload); refreshSoon(); }
 function activateApp() {
   fetch('/api/activate', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({pid: PID}),
+    body: JSON.stringify({pid: PID, window_id: WINDOW_ID}),
   }).catch(() => {});
 }
 
@@ -718,7 +885,7 @@ document.addEventListener('click', () => closeMenus(0));
 async function loadMenu() {
   if (menuStack.length) return;  // don't rebuild while a menu is open
   try {
-    const r = await fetch(`/app/${PID}/menu`);
+    const r = await fetch(`/app/${HANDLE}/menu`);
     if (r.ok) renderMenubar((await r.json()).menu || []);
   } catch (e) {}
 }
@@ -814,16 +981,15 @@ function render(d) {
   const size = w.w + 'x' + w.h;
   if (lastSize && size !== lastSize) restartStream(); // restart at the new resolution
   lastSize = size;
-  for (const el of [stage, screenEl]) {
-    setStyle(el, 'width', w.w + 'px'); setStyle(el, 'height', w.h + 'px');
-  }
+  setStyle(screenEl, 'width', w.w + 'px'); setStyle(screenEl, 'height', w.h + 'px');
+  winW = w.w; winH = w.h; applyScale();  // stage kept at native points, scaled to fit
   sync(overlay, d.nodes.filter(n => !n.offscreen));
   sync(off, d.nodes.filter(n => n.offscreen));
 }
 
 async function refresh() {
   try {
-    const r = await fetch(`/app/${PID}/dom`);
+    const r = await fetch(`/app/${HANDLE}/dom`);
     if (r.ok) render(await r.json());
   } catch (e) {}
 }
@@ -831,8 +997,10 @@ async function refresh() {
 // ---- Mouse: forward every pointer event on the stage as real HID input.
 // Coords are window-relative (the server adds the window origin -> global). ----
 function rel(ev) {
+  // screenEl lives inside the scaled #stage, so its rect is already in displayed
+  // (scaled) pixels; divide the offset by `scale` to get true window points.
   const r = screenEl.getBoundingClientRect();
-  return {x: ev.clientX - r.left, y: ev.clientY - r.top};
+  return {x: (ev.clientX - r.left) / scale, y: (ev.clientY - r.top) / scale};
 }
 let hoverAt = 0;         // last hover post (throttle)
 let press = null;        // {x,y} where the left button went down, while held
@@ -910,25 +1078,135 @@ stage.addEventListener('keyup', (ev) => {
   send({action: 'key', code: ev.code, down: false});
 });
 
-// Stream resilience: the server closes the MJPEG stream on capture failure or
-// window resize; restart it (with a status note) instead of showing a dead frame.
+// Stream transport. The page starts on MJPEG (the <img> src set server-side) and
+// upgrades to a lower-latency binary-JPEG WebSocket when it connects; if that
+// socket never opens (or drops) MJPEG keeps running, so nothing regresses.
 const statusEl = document.getElementById('status');
 let lastSize = null, statusTimer = null;
+
+// --- Low-latency WebSocket frames: swap each binary JPEG onto the <img> via a
+// Blob URL. The previous frame's URL is revoked on a short delay so it isn't
+// released mid-decode, keeping memory bounded to a couple of frames. ---
+let streamWS = null, wsFrames = false, curBlobUrl = null;
+function wsActive() { return streamWS && streamWS.readyState === 1 && wsFrames; }
+function connectStreamWS() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  let sock;
+  try { sock = new WebSocket(`${proto}://${location.host}/app/${HANDLE}/stream_ws`); }
+  catch (e) { return; }
+  sock.binaryType = 'blob';
+  streamWS = sock;
+  sock.onmessage = (ev) => {
+    wsFrames = true;
+    const url = URL.createObjectURL(ev.data);
+    const old = curBlobUrl; curBlobUrl = url;
+    screenEl.src = url;  // replaces the MJPEG connection on the first frame
+    statusEl.style.display = 'none';
+    if (old) setTimeout(() => URL.revokeObjectURL(old), 200);
+  };
+  sock.onclose = () => {
+    streamWS = null;
+    if (wsFrames) { wsFrames = false; restartStream(); }  // fall back to MJPEG
+    setTimeout(connectStreamWS, 1500);  // keep trying to restore the fast path
+  };
+  sock.onerror = () => { try { sock.close(); } catch (e) {} };
+}
+
 function restartStream() {
+  if (wsActive()) return;  // the WebSocket carries frames + handles resize itself
   statusEl.textContent = 'Reconnecting to app stream…';
   statusEl.style.display = 'block';
-  screenEl.src = `/app/${PID}/stream?ts=${Date.now()}`;
+  if (curBlobUrl) { URL.revokeObjectURL(curBlobUrl); curBlobUrl = null; }
+  screenEl.src = `/app/${HANDLE}/stream?ts=${Date.now()}`;
   clearTimeout(statusTimer);
   statusTimer = setTimeout(() => { statusEl.style.display = 'none'; }, 2000);
 }
 screenEl.addEventListener('error', () => setTimeout(restartStream, 500));
 screenEl.addEventListener('load', () => { statusEl.style.display = 'none'; });
+connectStreamWS();
+
+// ---- Left sidebar: running apps (icon + name), each expandable to its windows.
+// Clicking an app opens its focused window; clicking a window switches this page to
+// that handle. Live-updates via the apps SSE feed; windows of expanded apps poll. ----
+const sbApps = document.getElementById('sb-apps');
+const expanded = new Set();       // pids whose windows are shown
+const winCache = new Map();       // pid -> last windows list (instant re-render)
+if (PID) expanded.add(PID);       // current app expanded by default
+function renderApps(list) {
+  sbApps.replaceChildren();
+  for (const a of list) sbApps.appendChild(appRow(a));
+}
+function appRow(a) {
+  const wrap = document.createElement('div');
+  wrap.className = 'sb-app'; wrap.dataset.pid = a.pid;
+  const row = document.createElement('div');
+  row.className = 'sb-approw' + (a.pid === PID ? ' current' : '');
+  const caret = document.createElement('span');
+  caret.className = 'sb-caret'; caret.textContent = expanded.has(a.pid) ? '\\u25be' : '\\u25b8';
+  const icon = document.createElement('img');
+  icon.className = 'sb-icon'; icon.src = `/app/${a.pid}/icon`; icon.alt = '';
+  const name = document.createElement('span'); name.className = 'sb-name'; name.textContent = a.name;
+  row.append(caret, icon, name);
+  const wins = document.createElement('div');
+  wins.className = 'sb-wins'; wins.dataset.pid = a.pid;
+  wins.style.display = expanded.has(a.pid) ? '' : 'none';
+  caret.addEventListener('click', (e) => { e.stopPropagation(); toggleApp(a.pid, wins, caret); });
+  row.addEventListener('click', () => { location.href = '/app/' + a.pid; });
+  wrap.append(row, wins);
+  if (expanded.has(a.pid)) loadWins(a.pid, wins);
+  return wrap;
+}
+function toggleApp(pid, wins, caret) {
+  if (expanded.has(pid)) {
+    expanded.delete(pid); wins.style.display = 'none'; caret.textContent = '\\u25b8';
+  } else {
+    expanded.add(pid); wins.style.display = ''; caret.textContent = '\\u25be';
+    loadWins(pid, wins);
+  }
+}
+async function loadWins(pid, wins) {
+  if (winCache.has(pid)) renderWins(pid, wins, winCache.get(pid));  // instant
+  try {
+    const r = await fetch(`/app/${pid}/windows`);
+    if (!r.ok) return;
+    const list = (await r.json()).windows || [];
+    winCache.set(pid, list);
+    renderWins(pid, wins, list);
+  } catch (e) {}
+}
+function renderWins(pid, wins, list) {
+  wins.replaceChildren();
+  for (const w of list) {
+    const el = document.createElement('a');
+    el.className = 'sb-win' + (w.minimized ? ' min' : '');
+    const isCur = pid === PID && (WINDOW_ID !== null ? w.window_id === WINDOW_ID : !!w.focused);
+    if (isCur) el.classList.add('current');
+    el.href = (w.window_id != null) ? `/app/${pid}.${w.window_id}` : `/app/${pid}`;
+    el.textContent = w.title || '(untitled window)';
+    wins.appendChild(el);
+  }
+  if (!list.length) {
+    const e = document.createElement('div'); e.className = 'sb-empty';
+    e.textContent = 'No windows'; wins.appendChild(e);
+  }
+}
+fetch('/api/apps').then(r => r.json()).then(d => renderApps(d.apps || [])).catch(() => {});
+try {
+  const sbEs = new EventSource('/api/apps/events');
+  sbEs.onmessage = (ev) => { try { renderApps(JSON.parse(ev.data).apps || []); } catch (e) {} };
+} catch (e) {}
+setInterval(() => {  // keep expanded apps' window lists fresh (new/closed windows)
+  for (const pid of expanded) {
+    const wins = sbApps.querySelector(`.sb-wins[data-pid="${pid}"]`);
+    if (wins) loadWins(pid, wins);
+  }
+}, 4000);
 
 activateApp();  // one app at a time: raise it to the foreground on page load
 refresh(); // initial paint / fallback; live updates arrive over SSE below
 
 const banner = document.getElementById('banner');
-const es = new EventSource(`/app/${PID}/events`); // auto-reconnects on error
+const es = new EventSource(`/app/${HANDLE}/events`); // auto-reconnects on error
 es.onmessage = (ev) => {
   document.body.classList.remove('gone');
   render(JSON.parse(ev.data));

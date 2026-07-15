@@ -61,10 +61,12 @@ class WindowCapture:
     """Captures one app window by pid (works even when the window is occluded)."""
 
     def __init__(
-        self, pid: int, target_frame=None, get_frame=None, fps: float = 8.0, quality: float = 0.6
+        self, pid: int, target_frame=None, get_frame=None, fps: float = 8.0,
+        quality: float = 0.6, window_id: int | None = None
     ):
         self.pid = pid
         self.target_frame = target_frame  # (x, y, w, h) of the AX window, to disambiguate
+        self.target_window_id = window_id  # exact CGWindowID to capture, when known
         self.get_frame = get_frame  # callable -> current AX window (x, y, w, h) or None
         self.fps = fps
         self.quality = quality
@@ -90,14 +92,20 @@ class WindowCapture:
         def _key(w):
             f = w.frame()
             onscreen_pen = 0 if w.isOnScreen() else 1
+            # An exact CGWindowID match wins outright (prepended), so multi-window
+            # apps stream the addressed window; None leaves ranking unchanged.
+            id_pen = 0 if (
+                self.target_window_id is not None
+                and int(w.windowID()) == self.target_window_id
+            ) else 1
             if self.target_frame:
                 tx, ty, tw, th = self.target_frame
                 dist = (
                     abs(f.origin.x - tx) + abs(f.origin.y - ty)
                     + abs(f.size.width - tw) + abs(f.size.height - th)
                 )
-                return (dist, onscreen_pen)  # frame match wins; prefer on-screen on ties
-            return (onscreen_pen, -f.size.width * f.size.height)  # else on-screen, then biggest
+                return (id_pen, dist, onscreen_pen)  # id, then frame, then on-screen
+            return (id_pen, onscreen_pen, -f.size.width * f.size.height)
 
         cands = []
         for w in content.windows():
@@ -140,7 +148,10 @@ class WindowCapture:
                 continue
             b = w["kCGWindowBounds"]
             f = (b["X"], b["Y"], b["Width"], b["Height"])
-            if self.target_frame:
+            if self.target_window_id is not None and \
+                    int(w["kCGWindowNumber"]) == self.target_window_id:
+                score = -1e18  # exact CGWindowID match wins outright
+            elif self.target_frame:
                 score = sum(abs(a - t) for a, t in zip(f, self.target_frame))
             else:
                 score = -f[2] * f[3]  # biggest window wins
@@ -224,20 +235,15 @@ class WindowCapture:
                 self._filter = None  # window moved/resized: re-resolve now
         return self.frame_jpeg()
 
-    async def mjpeg(self):
-        """Async generator yielding multipart MJPEG chunks. It's async (not a sync
-        generator) so an open stream does NOT pin an anyio threadpool worker while
-        it sleeps/blocks: the blocking SCK/AX capture runs in the default executor
-        and pacing uses asyncio.sleep, so many concurrent tabs no longer starve the
-        pool that serves the other sync endpoints. Returns (closing the HTTP stream,
-        so the client <img> fires onerror) after ~5s of capture failures rather than
-        looping silently forever.
-
-        server.py integrator: StreamingResponse consumes this async generator
-        directly on the event loop, so `/app/{pid}/stream` needs no change even
-        though app_stream is a plain `def` (the handler just builds the response and
-        returns; iteration happens on the loop). Making app_stream `async def` is
-        optional/cleaner but not required."""
+    async def jpegs(self):
+        """Async generator yielding raw JPEG frames, paced to `fps`. It's async (not
+        a sync generator) so an open stream does NOT pin an anyio threadpool worker
+        while it sleeps/blocks: the blocking SCK/AX capture runs in the default
+        executor and pacing uses asyncio.sleep, so many concurrent tabs no longer
+        starve the pool that serves the other sync endpoints. Returns after ~5s of
+        capture failures rather than looping silently forever (the MJPEG wrapper
+        closes the HTTP stream so the client <img> fires onerror; the stream_ws
+        wrapper closes the socket so the client falls back to MJPEG)."""
         loop = asyncio.get_running_loop()
         errors = 0
         while True:
@@ -252,8 +258,17 @@ class WindowCapture:
                     return
                 await asyncio.sleep(1.0)
                 continue
+            yield jpg
+            await asyncio.sleep(max(0.0, 1.0 / self.fps - (time.time() - t0)))
+
+    async def mjpeg(self):
+        """multipart/x-mixed-replace MJPEG framing around jpegs() — the fallback
+        transport. server.py integrator: StreamingResponse consumes this async
+        generator directly on the event loop, so `/app/{pid}/stream` needs no change
+        even though app_stream is a plain `def` (the handler just builds the response
+        and returns; iteration happens on the loop)."""
+        async for jpg in self.jpegs():
             yield (
                 b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
                 + str(len(jpg)).encode() + b"\r\n\r\n" + jpg + b"\r\n"
             )
-            await asyncio.sleep(max(0.0, 1.0 / self.fps - (time.time() - t0)))

@@ -47,36 +47,40 @@ COALESCE_S = 0.04  # let notification bursts settle before re-walking
 SAFETY_NET_S = 2.0  # re-walk at least this often even without notifications
 IDLE_GRACE_S = 30.0  # retire a watcher this long after its last subscriber leaves
 
-_watchers: dict[int, "DomWatcher"] = {}
+_watchers: dict[tuple, "DomWatcher"] = {}  # (pid, window_id|None) -> watcher
 _registry_lock = threading.Lock()
 
 
 def subscribe(
-    pid: int, loop: asyncio.AbstractEventLoop
+    pid: int, loop: asyncio.AbstractEventLoop, window_id: int | None = None
 ) -> tuple["DomWatcher", asyncio.Queue]:
-    """Get-or-create the watcher for `pid` and atomically register a subscriber,
-    so a watcher can't be retired for idleness in the gap between the two."""
+    """Get-or-create the watcher for (pid, window_id) and atomically register a
+    subscriber, so a watcher can't be retired for idleness in the gap between the
+    two. window_id None watches the focused/main window (back-compat)."""
+    key = (pid, window_id)
     q: asyncio.Queue = asyncio.Queue()
     with _registry_lock:
-        w = _watchers.get(pid)
+        w = _watchers.get(key)
         if w is None or w._stop.is_set():
-            w = _watchers[pid] = DomWatcher(pid, loop)
+            w = _watchers[key] = DomWatcher(pid, loop, window_id)
         with w._lock:
             w._subs.add(q)
     return w, q
 
 
-def kick(pid: int) -> None:
-    """Nudge the watcher for `pid`, if one exists (no-op otherwise)."""
+def kick(pid: int, window_id: int | None = None) -> None:
+    """Nudge the watcher for (pid, window_id), if one exists (no-op otherwise)."""
     with _registry_lock:
-        w = _watchers.get(pid)
+        w = _watchers.get((pid, window_id))
     if w:
         w.kick()
 
 
 class DomWatcher:
-    def __init__(self, pid: int, loop: asyncio.AbstractEventLoop):
+    def __init__(self, pid: int, loop: asyncio.AbstractEventLoop, window_id: int | None = None):
         self.pid = pid
+        self.window_id = window_id
+        self.key = (pid, window_id)
         self.loop = loop
         self._dirty = threading.Event()
         self._dirty.set()  # walk immediately on start
@@ -88,7 +92,8 @@ class DomWatcher:
         self._observer = None  # kept alive; run-loop source references it
         self._app_el = None
         self._focused_el = None  # element the focused-value notifications are on
-        threading.Thread(target=self._run, name=f"domwatch-{pid}", daemon=True).start()
+        name = f"domwatch-{pid}" + (f".{window_id}" if window_id is not None else "")
+        threading.Thread(target=self._run, name=name, daemon=True).start()
 
     def kick(self) -> None:
         self._dirty.set()
@@ -105,8 +110,8 @@ class DomWatcher:
             with self._lock:
                 if self._subs and not force:
                     return False
-            if _watchers.get(self.pid) is self:
-                del _watchers[self.pid]
+            if _watchers.get(self.key) is self:
+                del _watchers[self.key]
             self._stop.set()
             return True
 
@@ -140,7 +145,12 @@ class DomWatcher:
                 last_walk = time.monotonic()
                 self._walk()
             self._detach_observer()
-        ax.forget(self.pid)
+        # Process gone: wipe every window's state. Otherwise just this window's,
+        # so a sibling window's watcher keeps its registry.
+        if self._gone:
+            ax.forget(self.pid)
+        else:
+            ax.forget_window(self.pid, self.window_id)
 
     def _attach_observer(self):
         """Register AX notifications on the app element. Failure is non-fatal:
@@ -194,7 +204,7 @@ class DomWatcher:
 
     def _walk(self):
         try:
-            snap = ax.snapshot(self.pid)
+            snap = ax.snapshot(self.pid, self.window_id)
             item = (
                 None,
                 json.dumps(

@@ -23,7 +23,18 @@ import threading
 import time
 
 import objc
-from AppKit import NSBundle, NSRunningApplication, NSWorkspace
+from AppKit import (
+    NSBitmapImageFileTypePNG,
+    NSBitmapImageRep,
+    NSBundle,
+    NSCalibratedRGBColorSpace,
+    NSCompositingOperationSourceOver,
+    NSGraphicsContext,
+    NSMakeRect,
+    NSRunningApplication,
+    NSWorkspace,
+    NSZeroRect,
+)
 
 CATALOG_TTL_S = 60.0  # mdfind + ~400 NSBundle reads is the cost; cache the catalog
 POLL_S = 1.5          # correctness backbone: catch every launch/terminate within this
@@ -164,6 +175,48 @@ def _installed_apps() -> list[dict]:
         pid = pids.get(a["bundle_id"]) if a["bundle_id"] else None
         out.append({**a, "running": pid is not None, "pid": pid})
     return out
+
+
+# -- icons -------------------------------------------------------------------
+
+_ICON_SIZE = 36
+_icon_cache: dict[int, bytes | None] = {}  # pid -> png (an app's icon is stable)
+_icon_lock = threading.Lock()
+
+
+def icon_png(pid: int, size: int = _ICON_SIZE) -> bytes | None:
+    """The running app's icon as a small PNG, or None. Drawn into a bitmap-backed
+    graphics context (no lockFocus), so it's safe off the main thread."""
+    with _icon_lock:
+        if pid in _icon_cache:
+            return _icon_cache[pid]
+    png = _render_icon(pid, size)
+    with _icon_lock:
+        _icon_cache[pid] = png
+    return png
+
+
+def _render_icon(pid: int, size: int) -> bytes | None:
+    app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+    img = app.icon() if app is not None else None
+    if img is None:
+        return None
+    rep = NSBitmapImageRep.alloc().initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel_(
+        None, size, size, 8, 4, True, False, NSCalibratedRGBColorSpace, 0, 0
+    )
+    if rep is None:
+        return None
+    ctx = NSGraphicsContext.graphicsContextWithBitmapImageRep_(rep)
+    if ctx is None:
+        return None
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.setCurrentContext_(ctx)
+    img.drawInRect_fromRect_operation_fraction_(
+        NSMakeRect(0, 0, size, size), NSZeroRect, NSCompositingOperationSourceOver, 1.0
+    )
+    NSGraphicsContext.restoreGraphicsState()
+    data = rep.representationUsingType_properties_(NSBitmapImageFileTypePNG, {})
+    return bytes(data) if data else None
 
 
 # -- open --------------------------------------------------------------------
