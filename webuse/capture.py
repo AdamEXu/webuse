@@ -9,6 +9,7 @@ from AppKit import (
     NSBitmapImageFileTypeJPEG,
     NSBitmapImageRep,
     NSImageCompressionFactor,
+    NSRunningApplication,
     NSScreen,
 )
 from Quartz import (
@@ -246,17 +247,27 @@ class WindowCapture:
         wrapper closes the socket so the client falls back to MJPEG)."""
         loop = asyncio.get_running_loop()
         errors = 0
+        last = None
         while True:
             t0 = time.time()
             try:
                 jpg = await loop.run_in_executor(None, self._next_frame)
                 errors = 0
+                last = jpg
             except CaptureError:
                 self._filter = None
                 errors += 1
-                if errors >= 5:
+                # A live stream must survive transient capture hiccups (an SCK burp,
+                # the window briefly occluded, a CGWindowList miss) rather than dying
+                # and going black. Keep retrying while the app is alive, and re-emit
+                # the last good frame so the client FREEZES on it (and recovers when
+                # capture returns) instead of losing the stream. End only when the
+                # app has actually quit.
+                if NSRunningApplication.runningApplicationWithProcessIdentifier_(self.pid) is None:
                     return
-                await asyncio.sleep(1.0)
+                if last is not None:
+                    yield last
+                await asyncio.sleep(min(0.25 * errors, 1.5))
                 continue
             yield jpg
             await asyncio.sleep(max(0.0, 1.0 / self.fps - (time.time() - t0)))
