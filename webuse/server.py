@@ -41,10 +41,26 @@ _PROXY_HEADERS = (
 )
 
 
+# Set once a public tunnel (tinyfi.sh) is open. A raw `ssh -R` forward delivers
+# every remote request to localhost with an attacker-controllable Host header and
+# no proxy markers, so it is indistinguishable from a direct local request — the
+# ONLY safe rule while exposed is: trust nothing without the token. main.py calls
+# mark_tunnel_active() after starting the tunnel.
+_tunnel_active = False
+
+
+def mark_tunnel_active() -> None:
+    global _tunnel_active
+    _tunnel_active = True
+
+
 def _is_local(request: Request) -> bool:
-    """True only for direct loopback requests. A tunnel (e.g. cloudflared) proxies
-    via 127.0.0.1, so the socket peer alone proves nothing — also require a
-    loopback Host header and no proxy-forwarding headers."""
+    """True only for direct loopback requests. A tunnel proxies via 127.0.0.1, so
+    the socket peer alone proves nothing — require a loopback Host header and no
+    proxy-forwarding headers. When a public tunnel is open, localhost trust is
+    disabled outright (a raw ssh -R forward can forge all of those signals)."""
+    if _tunnel_active:
+        return False
     client = request.client.host if request.client else ""
     if client not in ("127.0.0.1", "::1"):
         return False
@@ -441,13 +457,38 @@ async def app_stream_ws(ws: WebSocket, handle: str):
         return (w["x"], w["y"], w["w"], w["h"]) if w else None
 
     cap = WindowCapture(pid, target_frame=frame(), get_frame=frame, window_id=window_id)
+    gen = cap.jpegs()
+    # A stream socket only ever pushes frames; the client never sends. So a
+    # graceful close (close frame) can't surface on the send path — and an abrupt
+    # drop makes the transport log "socket.send() raised exception" per frame
+    # without raising to us. Watch receive() concurrently: it raises on disconnect,
+    # letting us stop the loop AND close the generator so no frame is produced for
+    # a dead socket.
+    gone = asyncio.Event()
+
+    async def _watch_close():
+        try:
+            while True:
+                await ws.receive()
+        except Exception:
+            pass
+        finally:
+            gone.set()
+
+    watcher = asyncio.create_task(_watch_close())
     try:
-        async for jpg in cap.jpegs():
-            await ws.send_bytes(jpg)
-    except (WebSocketDisconnect, RuntimeError):
-        pass  # client went away (send after disconnect raises RuntimeError)
+        async for jpg in gen:
+            if gone.is_set():
+                break
+            try:
+                await ws.send_bytes(jpg)
+            except Exception:
+                break  # client went away; stop sending and stop capturing
     except Exception:
         pass
+    finally:
+        watcher.cancel()
+        await gen.aclose()  # stop pulling capture frames for a dead socket
 
 
 def _global_target(pid: int, s: Step, window_id: int | None) -> tuple[float, float] | None:
@@ -540,6 +581,8 @@ def _ws_authed(ws: WebSocket) -> bool:
     tok = ws.query_params.get("token") or ws.cookies.get("webuse_token")
     if _token_ok(tok):
         return True
+    if _tunnel_active:  # exposed: token required, no localhost trust (see _is_local)
+        return False
     client = ws.client.host if ws.client else ""
     if client not in ("127.0.0.1", "::1") or any(h in ws.headers for h in _PROXY_HEADERS):
         return False
@@ -656,7 +699,11 @@ body { margin: 0; font: 13px -apple-system, sans-serif; }
 #stagebox { position: relative; overflow: hidden; }
 #stage { position: absolute; left: 0; top: 0; transform-origin: top left;
   overflow: hidden; outline: none; touch-action: none; }
-#screen { display: block; position: absolute; left: 0; top: 0; }
+/* The feed fills the native-sized #stage and NEVER stretches: object-fit:contain
+   letterboxes if a just-arrived frame's aspect differs from the current window
+   dims (that mismatch is transient — the next snapshot corrects winW/winH). */
+#screen { display: block; position: absolute; left: 0; top: 0;
+  width: 100%; height: 100%; object-fit: contain; }
 @media (prefers-color-scheme: dark) {
   #sidebar { background: #1e1e20; border-color: #3a3a3d; }
   #sb-home { background: #1e1e20; border-color: #333; }
@@ -768,8 +815,9 @@ const stagebox = document.getElementById('stagebox');
 // fit the area left of the sidebar / below the menu bar, preserving aspect via the
 // more-constraining axis, never enlarging (scale <= 1). The whole #stage is scaled
 // with one CSS transform, so the ghost overlay (native coords inside it) stays
-// pixel-aligned with the streamed frame. rel() divides displayed offsets by `scale`
-// to recover true window points before any input is sent. ----
+// pixel-aligned with the streamed frame. rel() maps events via #screen's live
+// getBoundingClientRect fractions × the current window points — scale-invariant,
+// so a mid-resize scale mismatch can't offset input. ----
 let winW = 0, winH = 0, scale = 1;
 function applyScale() {
   if (!winW || !winH) return;
@@ -981,8 +1029,10 @@ function render(d) {
   const size = w.w + 'x' + w.h;
   if (lastSize && size !== lastSize) restartStream(); // restart at the new resolution
   lastSize = size;
-  setStyle(screenEl, 'width', w.w + 'px'); setStyle(screenEl, 'height', w.h + 'px');
-  winW = w.w; winH = w.h; applyScale();  // stage kept at native points, scaled to fit
+  // ONE source of truth for the current window: winW/winH size #stage and the
+  // uniform scale; #screen fills #stage (object-fit:contain), so it can't stretch.
+  // Updated atomically on every snapshot/resize so a resize can't leave stale dims.
+  winW = w.w; winH = w.h; applyScale();
   sync(overlay, d.nodes.filter(n => !n.offscreen));
   sync(off, d.nodes.filter(n => n.offscreen));
 }
@@ -997,10 +1047,14 @@ async function refresh() {
 // ---- Mouse: forward every pointer event on the stage as real HID input.
 // Coords are window-relative (the server adds the window origin -> global). ----
 function rel(ev) {
-  // screenEl lives inside the scaled #stage, so its rect is already in displayed
-  // (scaled) pixels; divide the offset by `scale` to get true window points.
+  // Map from #screen's LIVE rect to true window points via fractions, so this is
+  // scale-invariant and resize-robust: no dependence on a separately-stored (and
+  // possibly stale, mid-resize) `scale`. Same geometry the ghost overlay uses, so
+  // clicks and highlights stay aligned under any scale.
   const r = screenEl.getBoundingClientRect();
-  return {x: (ev.clientX - r.left) / scale, y: (ev.clientY - r.top) / scale};
+  const fx = r.width ? (ev.clientX - r.left) / r.width : 0;
+  const fy = r.height ? (ev.clientY - r.top) / r.height : 0;
+  return {x: fx * winW, y: fy * winH};
 }
 let hoverAt = 0;         // last hover post (throttle)
 let press = null;        // {x,y} where the left button went down, while held
