@@ -1179,7 +1179,7 @@ let lastSize = null, statusTimer = null;
 // --- Low-latency WebSocket frames: swap each binary JPEG onto the <img> via a
 // Blob URL. The previous frame's URL is revoked on a short delay so it isn't
 // released mid-decode, keeping memory bounded to a couple of frames. ---
-let streamWS = null, wsFrames = false, curBlobUrl = null;
+let streamWS = null, wsFrames = false, curBlobUrl = null, pendingReq = false;
 function wsActive() { return streamWS && streamWS.readyState === 1 && wsFrames; }
 function connectStreamWS() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -1188,8 +1188,9 @@ function connectStreamWS() {
   catch (e) { return; }
   sock.binaryType = 'blob';
   streamWS = sock;
-  sock.onopen = () => { try { sock.send('n'); } catch (e) {} };  // pull the first frame
+  sock.onopen = () => { pendingReq = true; try { sock.send('n'); } catch (e) {} };  // pull the first frame
   sock.onmessage = (ev) => {
+    pendingReq = false;  // the frame we asked for arrived
     wsFrames = true;
     const url = URL.createObjectURL(ev.data);
     const old = curBlobUrl; curBlobUrl = url;
@@ -1217,7 +1218,9 @@ function restartStream() {
 // Client-paced pull: request the next frame only AFTER this one has rendered (or
 // failed), so the server never outruns our display+network rate — no backlog.
 function pullNext() {
+  if (pendingReq) return;  // never more than one outstanding request -> no runaway backlog
   if (streamWS && streamWS.readyState === 1 && wsFrames) {
+    pendingReq = true;
     try { streamWS.send('n'); } catch (e) {}
   }
 }
