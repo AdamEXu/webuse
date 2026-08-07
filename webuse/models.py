@@ -47,3 +47,20 @@ class Action(BaseModel):
 class Activate(BaseModel):
     pid: int
     window_id: int | None = None
+
+
+class TermInput(BaseModel):
+    """One write to a terminal session. `value` is literal text, `key` a named
+    control key (Enter, Ctrl-C, Up…); both may be sent, text first."""
+
+    value: str | None = None
+    key: str | None = None
+    enter: bool = False  # append Return — "type a command and run it" in one call
+    wait: bool = True  # block until output goes quiet, so the reply holds the result
+    quiet_ms: int = 250  # how long output must be silent to count as settled
+    timeout_ms: int = 10000  # give up waiting (the command keeps running regardless)
+
+
+class TermResize(BaseModel):
+    cols: int
+    rows: int

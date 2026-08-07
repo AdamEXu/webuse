@@ -79,6 +79,17 @@ def app_dom(handle: str):
     }
 
 
+@router.get("/app/{handle}/focus")
+def app_focus(handle: str):
+    """Where the app's keyboard focus currently sits. The compose bar polls this
+    so text is only ever sent at a target the caller can see."""
+    try:
+        pid, _ = _parse(handle)
+    except ValueError:
+        return JSONResponse({"error": "bad app handle"}, status_code=400)
+    return {"focus": ax.focused_info(pid)}
+
+
 def _sse(item: tuple[str | None, str]) -> str:
     event, payload = item
     prefix = f"event: {event}\n" if event else ""

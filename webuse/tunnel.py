@@ -1,46 +1,68 @@
-"""Native tinyfi.sh reverse-tunnel so `uv run python main.py` is publicly
-reachable with no extra steps.
+"""Named Cloudflare tunnel, so the public URL is a stable hostname you own.
 
-tinyfi.sh is a free SSH reverse-tunnel service: an `ssh -R <sub>:80:localhost:<port>`
-to tinyfi.sh publishes the local port at https://<sub>.tinyfi.sh. We spawn that
-ssh in a background thread, auto-reconnect with backoff if it drops, and shut it
-down cleanly on exit. Failure is non-fatal — the server keeps serving locally.
+`cloudflared tunnel run <name>` dials out to Cloudflare and serves the local port
+at the hostname routed to that tunnel — no inbound ports, no per-boot URL churn.
+We supervise the process in a background thread, restart it with backoff if it
+drops, and shut it down cleanly on exit. Failure is never fatal: the server keeps
+serving locally.
+
+Setup is a one-time, account-level thing and deliberately NOT automated here
+(it mutates DNS on your zone):
+
+    cloudflared tunnel login
+    cloudflared tunnel create <name>
+    cloudflared tunnel route dns <name> <hostname>
 """
 
 import atexit
+import shutil
 import subprocess
 import threading
 import time
+from pathlib import Path
 
-HOST = "tinyfi.sh"
+CLOUDFLARED = "cloudflared"
+CERT = Path.home() / ".cloudflared" / "cert.pem"
+# A run that dies faster than this is a configuration error, not a network blip.
+FAST_FAIL_S = 5.0
 
 
-def build_argv(port: int, subdomain: str) -> list[str]:
-    """The exact ssh command that opens the reverse tunnel. Kept pure so it can be
-    unit-checked without ever connecting."""
+def build_argv(port: int, name: str) -> list[str]:
+    """The exact cloudflared command that publishes the local port. Kept pure so
+    it can be unit-checked without ever connecting."""
     return [
-        "ssh",
-        "-o", "StrictHostKeyChecking=accept-new",
-        "-o", "ServerAliveInterval=30",
-        "-o", "ServerAliveCountMax=3",
-        "-o", "ExitOnForwardFailure=yes",
-        "-N",  # no remote command: forward only
-        "-R", f"{subdomain}:80:localhost:{port}",
-        HOST,
+        CLOUDFLARED,
+        "tunnel",
+        "--no-autoupdate",  # don't let a self-update restart the tunnel mid-session
+        "run",
+        "--url", f"http://127.0.0.1:{port}",
+        name,
     ]
 
 
+def preflight() -> str | None:
+    """Why the tunnel can't start, as a human-readable reason, or None if it
+    looks ready. Checked before spawning so the failure is a clear message
+    instead of a process that silently dies in the background."""
+    if shutil.which(CLOUDFLARED) is None:
+        return "cloudflared is not installed — brew install cloudflared"
+    if not CERT.exists():
+        return f"cloudflared is not logged in ({CERT} missing) — run: cloudflared tunnel login"
+    return None
+
+
 class Tunnel:
-    """A supervised ssh reverse tunnel: one background thread respawns ssh with
+    """A supervised cloudflared process: one background thread respawns it with
     exponential backoff whenever it exits, until stop() is called."""
 
-    def __init__(self, port: int, subdomain: str):
+    def __init__(self, port: int, name: str):
         self.port = port
-        self.subdomain = subdomain
-        self.argv = build_argv(port, subdomain)
+        self.name = name
+        self.argv = build_argv(port, name)
         self._stop = threading.Event()
         self._proc: subprocess.Popen | None = None
-        self._thread = threading.Thread(target=self._run, name="tinyfi-tunnel", daemon=True)
+        self._warned = False
+        self._thread = threading.Thread(target=self._run, name="cf-tunnel", daemon=True)
 
     def start(self) -> "Tunnel":
         self._thread.start()
@@ -58,7 +80,7 @@ class Tunnel:
                     stderr=subprocess.DEVNULL,
                 )
             except OSError as e:
-                print(f"  ⚠ tunnel: could not launch ssh ({e}); serving locally only.")
+                print(f"  ⚠ tunnel: could not launch cloudflared ({e}); serving locally only.")
                 return
             # Close the race with stop(): if stop() ran between the while-check and
             # Popen, it couldn't see this child — terminate it ourselves and exit.
@@ -69,9 +91,18 @@ class Tunnel:
             self._proc.wait()
             if self._stop.is_set():
                 return
+            ran_for = time.monotonic() - started
+            # Say something the first time it dies instantly — otherwise a bad
+            # tunnel name or missing DNS route looks like "the URL just doesn't work".
+            if ran_for < FAST_FAIL_S and not self._warned:
+                self._warned = True
+                print(
+                    f"  ⚠ tunnel: cloudflared exited after {ran_for:.1f}s. Run this to see why:\n"
+                    f"      {' '.join(self.argv)}"
+                )
             # A tunnel that ran a while then dropped is a transient network blip —
-            # reconnect fast. One that dies immediately (bad auth/host) backs off.
-            if time.monotonic() - started > 30:
+            # reconnect fast. One that dies immediately backs off.
+            if ran_for > 30:
                 backoff = 1.0
             self._stop.wait(backoff)
             backoff = min(backoff * 2, 30.0)
@@ -90,7 +121,7 @@ class Tunnel:
                     pass
 
 
-def start(port: int, subdomain: str) -> Tunnel:
-    """Open a supervised reverse tunnel and return its handle (call .stop() to
-    close; it's also registered for clean shutdown at process exit)."""
-    return Tunnel(port, subdomain).start()
+def start(port: int, name: str) -> Tunnel:
+    """Open a supervised tunnel and return its handle (call .stop() to close; it's
+    also registered for clean shutdown at process exit)."""
+    return Tunnel(port, name).start()

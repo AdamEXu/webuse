@@ -57,10 +57,14 @@ export function build(n: GhostNode, existing?: HTMLElement): HTMLElement {
   setAttr(e, "aria-label", n.label);
   setAttr(e, "title", n.help || n.label); // AXHelp tooltip when present
   setAttr(e, n.kind === "text" ? "aria-placeholder" : "placeholder", n.placeholder);
-  if (n.tag === "input" || n.tag === "button") {
-    const d = e as HTMLInputElement | HTMLButtonElement;
-    if (d.disabled !== !!n.disabled) d.disabled = !!n.disabled;
-  }
+  // Disabled state is reported with aria-disabled, never the DOM `disabled`
+  // property: HTMLElement.click() on a disabled form control is spec'd to return
+  // without dispatching anything, so a real `disabled` ghost would silently
+  // swallow a node click — while the same control clicked by cursor still gets a
+  // real HID click (a disabled ghost isn't a hit-test target, so the stage
+  // handles it). The app decides what a click on a disabled control does; the
+  // ghost's job is to report state, not to filter input.
+  setAttr(e, "aria-disabled", n.disabled ? "true" : null);
   setStyle(e, "left", n.x + "px");
   setStyle(e, "top", n.y + "px");
   setStyle(e, "width", n.w + "px");

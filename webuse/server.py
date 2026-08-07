@@ -5,24 +5,32 @@ Thin by design — all logic lives in cohesive modules:
   security.py    auth/CSRF gate + middleware + ws auth
   models.py      Step/Action/Activate
   dispatch.py    the HID action engine
-  routes/        per-app endpoints + action API
+  terminal.py    persistent PTY shell sessions
+  routes/        per-app endpoints + action API + terminal API
   apps.py        installed/running-app catalog + launcher
 """
 
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import apps, security
-from .routes import action_routes, app_routes
+from . import apps, security, terminal
+from .routes import action_routes, app_routes, term_routes
 # Re-export so `from webuse.server import TOKEN, app` and `server.mark_tunnel_active()`
 # (used by main.py) keep working after the split.
 from .security import TOKEN, mark_tunnel_active  # noqa: F401
 
-app = FastAPI(title="webuse")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    yield
+    terminal.shutdown()  # reap the shells so stopping the server leaves no orphans
+
+
+app = FastAPI(title="webuse", lifespan=lifespan)
 security.add_auth_middleware(app)
 
 # Order matters: the specific API + per-app routers are registered BEFORE the SPA
@@ -30,6 +38,7 @@ security.add_auth_middleware(app)
 # stream_ws|ws) always win over the client-side-routing fallback below.
 app.include_router(apps.router)
 app.include_router(action_routes.router)
+app.include_router(term_routes.router)
 app.include_router(app_routes.router)
 
 

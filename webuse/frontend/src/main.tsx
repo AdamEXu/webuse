@@ -8,6 +8,7 @@ import "./index.css";
 import Layout from "./Layout";
 import Info from "./views/Info";
 import Driver from "./views/Driver";
+import TerminalView from "./views/Terminal";
 
 // StrictMode is intentionally omitted: the Driver opens long-lived EventSource
 // and WebSocket connections whose double-mount in dev would spawn duplicates.
@@ -18,6 +19,7 @@ const router = createBrowserRouter([
     children: [
       { index: true, element: <Navigate to="/info" replace /> },
       { path: "info", element: <Info /> },
+      { path: "terminal", element: <TerminalView /> },
       { path: "app/:handle", element: <Driver /> },
     ],
   },

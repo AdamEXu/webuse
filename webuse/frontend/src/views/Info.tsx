@@ -64,6 +64,61 @@ export default function Info() {
           acting to see what changed.
         </p>
 
+        <H2>Typing into an app</H2>
+        <p className="my-3">
+          Ghost text fields are <strong>non-editable mirrors</strong> of the app&rsquo;s real fields
+          — setting their value does nothing. Click the field in the app, then use the{" "}
+          <strong>compose bar</strong> under the stage: it is a real HTML input, so type your text
+          there and press <Code>Send</Code> (or <Code>Send ↵</Code> to submit it in one go). It shows
+          which control the app&rsquo;s keyboard focus is currently on, so you can tell the text will
+          land where you expect.
+        </p>
+        <p className="my-3">
+          Next to it is a row of <strong>key buttons</strong> — <Code>Enter</Code>, <Code>Tab</Code>,{" "}
+          <Code>Esc</Code>, arrows, <Code>⌘A</Code>, <Code>⌘C</Code>, <Code>⌘V</Code>. If your harness
+          can only fill text inputs and click, those buttons are how you press keys that typing
+          alone can&rsquo;t express.
+        </p>
+
+        <H2>Terminal — the non-GUI route</H2>
+        <div className="my-3 rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 dark:border-emerald-900 dark:bg-emerald-950/40">
+          <p className="m-0 leading-relaxed">
+            <strong>Terminal is a special app in the sidebar</strong>, and the same session is
+            stacked under every app page so you can watch the GUI and the shell at once. It is a
+            real <Code>zsh</Code> session on this <strong>macOS</strong> host — not a terminal app
+            being driven through the GUI.
+          </p>
+        </div>
+        <p className="my-3">
+          <strong>Prefer it whenever a command is shorter or more reliable than clicking.</strong>{" "}
+          To change the volume, don&rsquo;t hunt for a slider — run{" "}
+          <Code>osascript -e &apos;set volume output volume 30&apos;</Code>. Same for reading and
+          writing files, opening URLs (<Code>open -a Safari https://…</Code>), the clipboard (
+          <Code>pbcopy</Code> / <Code>pbpaste</Code>), system settings (<Code>defaults write</Code>),
+          git, and package managers.
+        </p>
+        <p className="my-3">
+          <strong>To run a command: type it in the box and click Run.</strong> That&rsquo;s all —
+          no API call and no page refresh. The output appears above the box and updates by itself,
+          so just re-read the page. A green <Code>running</Code> line shows while a command is still
+          going; the <Code>^C</Code> button interrupts it, <Code>^D</Code> sends EOF, and there are
+          Enter, Tab, Escape and arrow buttons (arrows recall previous commands).
+        </p>
+        <p className="my-3">
+          It is a pty, so <strong>cwd, environment, virtualenvs and history persist</strong> between
+          commands, and interactive programs work (<Code>python</Code>, <Code>ssh</Code>,{" "}
+          <Code>vim</Code>, anything that prompts) — answer their prompts by typing in the same box.
+          There is no exit code shown: read the output, or end the command with{" "}
+          <Code>; echo EXIT=$?</Code>.
+        </p>
+        <p className="my-2 text-[13px] leading-relaxed text-neutral-500 dark:text-neutral-400">
+          If your harness can make HTTP requests, the same session is also at{" "}
+          <Code>POST /api/term/main/input</Code> with{" "}
+          <Code>{'{"value":"ls -la","enter":true}'}</Code>, whose reply carries the rendered screen
+          plus <Code>busy</Code> (a command is still running) and <Code>settled</Code> (output went
+          quiet). The UI needs none of it.
+        </p>
+
         <p className="mt-10 border-t border-neutral-200 pt-4 text-[13px] text-neutral-500 dark:border-neutral-800 dark:text-neutral-400">
           Pick an app from the sidebar to open its page. Toggle <strong>Outline elements</strong>{" "}
           (or add <Code>?debug=1</Code> to the URL) to visualize the ghost DOM over the stream.

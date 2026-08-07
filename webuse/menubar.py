@@ -12,6 +12,7 @@ client-side.
 from ApplicationServices import AXUIElementCreateApplication
 
 from . import ax
+from .cocoa import pooled
 
 _MODS = [(1, "⇧"), (2, "⌥"), (4, "⌃")]  # AXMenuItemCmdModifiers bits; bit 3 (8) = no ⌘
 
@@ -59,6 +60,7 @@ def _row(pid: int, el, depth: int) -> dict:
     return node
 
 
+@pooled
 def read_menu(pid: int) -> list[dict]:
     """The app's menu bar as a tree of {title, id?, children?, disabled?,
     checked?, shortcut?, separator?}. Empty if the app exposes no menu bar."""

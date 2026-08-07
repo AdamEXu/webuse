@@ -63,6 +63,11 @@ export function useDriver(handle: string, refs: DriverRefs) {
       setStyle(stagebox!, "height", winH * scale + "px");
     }
     window.addEventListener("resize", applyScale);
+    // The stage also has to rescale when the area around it changes without a
+    // window resize — the compose bar growing, or the terminal panel being
+    // opened/dragged. Observe the container rather than guessing at events.
+    const stageRO = new ResizeObserver(() => applyScale());
+    stageRO.observe(stagewrap);
 
     // ---- Low-latency input over a WebSocket: one persistent connection carries
     // every mouse/keyboard step. Falls back to POST until the socket is open. ----
@@ -187,6 +192,26 @@ export function useDriver(handle: string, refs: DriverRefs) {
       const fy = r.height ? (ev.clientY - r.top) / r.height : 0;
       return { x: fx * winW, y: fy * winH };
     }
+    // Does this event carry a cursor position over the given element? A synthetic
+    // MouseEvent (element.click(), dispatchEvent without coords) reports 0,0.
+    function over(ev: MouseEvent, el: Element) {
+      const r = el.getBoundingClientRect();
+      return (
+        ev.clientX >= r.left && ev.clientX <= r.right &&
+        ev.clientY >= r.top && ev.clientY <= r.bottom
+      );
+    }
+    // An element's own center, mapped through the same fraction math as a cursor
+    // position (so it doesn't assume the overlay is the offsetParent).
+    function centerOf(el: Element) {
+      const r = el.getBoundingClientRect();
+      return rel({ clientX: (r.left + r.right) / 2, clientY: (r.top + r.bottom) / 2 });
+    }
+    // Only points that land on the window are real targets: a synthetic event's
+    // 0,0 maps outside it, and so does anything in the offscreen ghost list.
+    function onWindow(p: { x: number; y: number }) {
+      return p.x >= 0 && p.y >= 0 && p.x <= winW && p.y <= winH;
+    }
     let hoverAt = 0; // last hover post (throttle)
     let press: { x: number; y: number } | null = null; // where left went down
     let dragged = false; // moved past the drag threshold while pressed
@@ -229,17 +254,20 @@ export function useDriver(handle: string, refs: DriverRefs) {
       }
       if (ev.detail > 1) return; // dblclick handles doubles
       const p = rel(ev);
+      if (!onWindow(p)) return; // synthetic click on the stage: no point to aim at
       send({ action: "click", x: p.x, y: p.y });
       refreshSoon();
     }
     function onDblClick(ev: MouseEvent) {
       const p = rel(ev);
+      if (!onWindow(p)) return;
       send({ action: "dblclick", x: p.x, y: p.y });
       refreshSoon();
     }
     function onContextMenu(ev: MouseEvent) {
       ev.preventDefault();
       const p = rel(ev);
+      if (!onWindow(p)) return;
       send({ action: "rightclick", x: p.x, y: p.y });
       refreshSoon();
     }
@@ -271,22 +299,20 @@ export function useDriver(handle: string, refs: DriverRefs) {
     }
     function onGhostClick(ev: MouseEvent) {
       const el = (ev.target as HTMLElement | null)?.closest<HTMLElement>(".ghost");
-      if (!el || el.tagName === "SPAN") return; // static text isn't actionable
+      if (!el) return;
       ev.preventDefault(); // no anchor nav / default action — the app is driven, not the ghost
       ev.stopPropagation(); // the stage's coordinate onClick must not also fire
       if (swallowClick) {
         swallowClick = false;
         return;
       } // trailing click of a completed drag
-      const r = el.getBoundingClientRect();
-      const inside =
-        ev.clientX >= r.left &&
-        ev.clientX <= r.right &&
-        ev.clientY >= r.top &&
-        ev.clientY <= r.bottom;
-      const p = inside
-        ? rel(ev) // real cursor over the element -> its exact position
-        : { x: el.offsetLeft + el.offsetWidth / 2, y: el.offsetTop + el.offsetHeight / 2 }; // synthetic click -> element center (already window points)
+      // A real cursor over the element gives its exact position; a synthetic node
+      // click carries none, so aim at the element's dead center. Every ghost kind
+      // forwards, static text included: it sits over a real region of the app
+      // (a row, a cell, a label) that a cursor click would hit, and spans are
+      // pointer-events:none so only synthetic clicks ever reach here through one.
+      const p = over(ev, el) ? rel(ev) : centerOf(el);
+      if (!onWindow(p)) return; // an offscreen ghost has no point on the window
       send({ action: "click", x: p.x, y: p.y });
       refreshSoon();
     }
@@ -529,6 +555,7 @@ export function useDriver(handle: string, refs: DriverRefs) {
     return () => {
       disposed = true;
       uninstallSdk();
+      stageRO.disconnect();
       window.removeEventListener("resize", applyScale);
       window.removeEventListener("blur", releaseHeld);
       document.removeEventListener("visibilitychange", onVisibility);

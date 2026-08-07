@@ -55,22 +55,60 @@ During development the permissions attach to your **terminal** (or whatever proc
 | Page | What it is |
 | --- | --- |
 | `/` | Home: permission checklist + a live grid of running apps (updates as you open/quit apps). |
-| `/app/{pid}` | A single app rendered as a ghost DOM over its live screen stream. |
+| `/app/{pid}` | A single app rendered as a ghost DOM over its live screen stream, with a compose bar and a terminal stacked below it. |
 | `/app/{pid}?debug=1` | Same, with every ghost element outlined — a "show layout bounds" for macOS. |
+| `/terminal` | A real zsh session on this Mac, listed in the sidebar like an app. Same session as the panel under every app page. |
 
-**Sharing with a cloud agent (Cloudflare Tunnel).** The server prints an auth token at startup:
+### Typing, keys, and the terminal
+
+Ghost text fields are non-editable mirrors, and many web agents can only fill text inputs and
+click — they can't press arbitrary keys or call an HTTP API. So the chrome provides both as
+plain DOM:
+
+- **Compose bar** (under the app) — a real `<input>`; type text and click **Send** (or **Send ↵**)
+  and it's delivered to the app as actual HID keystrokes. It shows which control currently has the
+  app's keyboard focus. Beside it, buttons for `Enter` `Tab` `Esc` arrows `⌘A` `⌘C` `⌘V` — the keys
+  typing alone can't express.
+- **Terminal** — type a command, click **Run**, read the output that appears above the box (it
+  updates by itself over SSE). **Prefer it over driving the GUI for anything a command can do**:
+  `osascript -e 'set volume output volume 30'` beats hunting for a volume slider. It's a pty, so
+  cwd/env/virtualenvs/history persist and interactive programs work (`python`, `ssh`, `vim`). A
+  `running` indicator shows while a command holds the terminal; `^C` interrupts it.
+
+## Sharing with a cloud agent (Cloudflare Tunnel)
+
+webuse publishes itself through a **named Cloudflare tunnel**, so the public URL is a stable
+hostname you own — it survives reboots and reconnects, and needs no inbound ports. One-time setup
+(the `login` step opens a browser and asks which zone to authorize):
 
 ```sh
-cloudflared tunnel --url http://127.0.0.1:8787
-# then hand the agent:  https://<tunnel>.trycloudflare.com/?token=<token>
+brew install cloudflared
+cloudflared tunnel login
+cloudflared tunnel create webuse-mbp
+cloudflared tunnel route dns webuse-mbp tf-mbp.example.com   # creates the CNAME on your zone
 ```
 
-The first tokened request sets a cookie; subsequent requests are authorized. Direct localhost
-requests skip the token; any *proxied* request (i.e. through the tunnel) must carry it.
+Then tell webuse about it once — both settings persist to `~/.config/webuse/`, so later runs need
+no flags:
 
-> ⚠️ **Treat the tunnel URL as root on your Mac.** Anyone with the URL + token can see your screen
-> and click anything. For anything beyond a quick test, put Cloudflare Access in front of a named
-> tunnel. Also: `/app/{pid}/dom` exposes the full text of the app's window — don't stream an app
+```sh
+uv run python main.py --hostname tf-mbp.example.com --tunnel-name webuse-mbp
+uv run python main.py     # from now on, publishes to the same hostname
+uv run python main.py --local   # serve on localhost only
+```
+
+The server prints `https://tf-mbp.example.com/?token=<token>` at startup — hand that to the agent.
+The first tokened request sets a cookie; subsequent requests are authorized. While the tunnel is
+up, **every** request needs the token, including local ones (the tunnel delivers to localhost, so
+the localhost shortcut is switched off rather than trusted).
+
+> ⚠️ **Treat the tunnel URL as root on your Mac.** Anyone with the URL + token can see your screen,
+> click anything, and — via `/terminal` — run arbitrary shell commands as you. That is the point of
+> the feature, but the token is the only thing between the internet and your account, and the
+> hostname is now stable and guessable, so the token is doing all the work. Rotate it by deleting
+> `~/.config/webuse/token`. For stronger protection, put Cloudflare Access in front of the hostname
+> — but note that an identity policy will block browser-driving agents, which can't complete the
+> login. Also: `/app/{pid}/dom` exposes the full text of the app's window — don't stream an app
 > showing secrets.
 
 ## HTTP API (what an agent calls)
@@ -86,6 +124,12 @@ All routes accept the token via `?token=` (once, to set the cookie) when not on 
 | `GET /api/apps` | `?installed=1` for the full catalog | Running apps (or all installed apps with launch info). |
 | `POST /api/apps/open` | `{bundle_id?}` / `{name?}` / `{path?}` | Launch an app; returns its `pid`. |
 | `GET /api/apps/events` | — | SSE: running-app launches/quits. |
+| `GET /app/{pid}/focus` | — | Where the app's keyboard focus sits: `{role, label, value, editable}`. |
+| `POST /api/term/{sid}/input` | `{value?, key?, enter?, wait?}` | Write to a shell session (created on demand — `main` is the one the UI uses). Returns the rendered screen. |
+| `GET /api/term/{sid}` | — | The session's transcript + `busy` / `alive`. |
+| `GET /api/term/{sid}/events` | — | SSE: pushes the transcript as the shell writes. |
+| `POST /api/term/{sid}/resize` | `{cols, rows}` | Resize the shell's grid. |
+| `DELETE /api/term/{sid}` | — | Kill the shell (the name stays usable). |
 
 **Actions** (`action` field):
 - `press` — `AXPress` the element with `id` (a real semantic click; works on off-screen elements).
@@ -106,6 +150,7 @@ browser agent ─HTTP→ FastAPI (webuse/server.py)
                         ├─ dom.py       map AX roles → HTML tags
                         ├─ capture.py   ScreenCaptureKit → MJPEG (CGWindowList fallback; captures occluded / off-Space windows)
                         ├─ watch.py     per-app AXObserver on a background CFRunLoop → SSE push (instant DOM updates)
+                        ├─ terminal.py  persistent pty shells; ANSI rendered to text by pyte
                         └─ apps.py      installed-app catalog, launch, live running-app SSE
 ```
 

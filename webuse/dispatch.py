@@ -3,6 +3,7 @@ deliver it as real input (click/drag/scroll/key/type) or a discovery-side AX
 action. Every real-input path funnels through dispatch()."""
 
 from . import ax, input, windows
+from .cocoa import pooled
 from .models import Step
 
 
@@ -23,6 +24,7 @@ def _rel_point(pid: int, gx: float, gy: float, window_id: int | None) -> list[fl
     return [round(gx - win["x"], 1), round(gy - win["y"], 1)] if win else None
 
 
+@pooled
 def dispatch(pid: int, s: Step, window_id: int | None = None) -> dict:
     if s.activate:
         input.activate(pid)

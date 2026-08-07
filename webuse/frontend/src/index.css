@@ -575,3 +575,367 @@ body.debug span.ghost {
     background: #444;
   }
 }
+
+/* ============================================================
+   COMPOSE BAR + TERMINAL
+   Two chrome surfaces that exist because a web agent can typically only
+   fill text inputs and click: real editable inputs whose contents are
+   delivered as real HID keystrokes (compose) or to a real shell (terminal),
+   plus keycap buttons for every key that typing alone can't express.
+   ============================================================ */
+
+/* -- shared keycaps -------------------------------------------------- */
+.keycap {
+  flex: 0 0 auto;
+  font: 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #333;
+  background: #fff;
+  border: 1px solid #cfcfd4;
+  border-radius: 5px;
+  padding: 3px 7px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.keycap:hover {
+  background: #eef2ff;
+  border-color: #9db4f0;
+}
+.keycap:active {
+  background: #dfe7fb;
+}
+
+/* -- compose bar (under the app stage) ------------------------------- */
+#compose {
+  flex: 0 0 auto;
+  padding: 6px 10px 8px;
+  background: #f5f5f7;
+  border-top: 1px solid #d0d0d0;
+}
+.compose-target {
+  font-size: 11px;
+  margin-bottom: 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.compose-target-label {
+  font-weight: 600;
+}
+.compose-target.ok {
+  color: #2c7a4b;
+}
+.compose-target.warn {
+  color: #a06000;
+}
+.compose-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.compose-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  font: 13px -apple-system, sans-serif;
+  color: #111;
+  background: #fff;
+  border: 1px solid #cfcfd4;
+  border-radius: 6px;
+  padding: 6px 9px;
+}
+.compose-input:focus {
+  outline: none;
+  border-color: #4c8bf5;
+  box-shadow: 0 0 0 2px rgba(76, 139, 245, 0.2);
+}
+.compose-send {
+  flex: 0 0 auto;
+  font: 600 12px -apple-system, sans-serif;
+  color: #333;
+  background: #fff;
+  border: 1px solid #cfcfd4;
+  border-radius: 6px;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+.compose-send:hover:not(:disabled) {
+  background: #ececef;
+}
+.compose-send.primary {
+  color: #fff;
+  background: #4c8bf5;
+  border-color: #4c8bf5;
+}
+.compose-send.primary:hover:not(:disabled) {
+  background: #3d7ae8;
+}
+.compose-send:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.compose-keys {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+/* -- terminal (stacked panel + standalone page) ---------------------- */
+#termpanel {
+  flex: 0 0 auto;
+  position: relative;
+  background: #f5f5f7;
+  border-top: 1px solid #d0d0d0;
+}
+/* Drag the top edge to trade height with the app stage above. */
+.term-grip {
+  position: absolute;
+  top: -3px;
+  left: 0;
+  right: 0;
+  height: 6px;
+  cursor: ns-resize;
+  z-index: 2;
+}
+.term-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 10px;
+}
+.term-toggle {
+  flex: 0 0 auto;
+  font: 600 12px -apple-system, sans-serif;
+  color: #333;
+  background: none;
+  border: 0;
+  padding: 2px 0;
+  cursor: pointer;
+}
+.term-panel-hint {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11px;
+  color: #888;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.term-panel-body {
+  min-height: 0;
+  padding: 0 10px 8px;
+}
+
+.term-page {
+  padding: 16px 20px 12px;
+}
+.term-head h1 {
+  margin: 0 0 4px;
+  font-size: 20px;
+  font-weight: 700;
+  color: #111;
+}
+.term-head p {
+  margin: 0 0 10px;
+  font-size: 12px;
+  color: #666;
+  max-width: 70ch;
+}
+
+.term {
+  position: relative; /* anchors the hidden cell-metrics probe */
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  gap: 6px;
+}
+/* Reveals the scrollback the screen holds back. Above the transcript, so a
+   reader that only gets part of the page still sees that more exists. */
+.term-more {
+  flex: 0 0 auto;
+  align-self: flex-start;
+  font: 11px -apple-system, sans-serif;
+  color: #555;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  text-decoration: underline;
+}
+.term-screen {
+  flex: 1 1 auto;
+  min-height: 0;
+  margin: 0;
+  overflow: auto;
+  white-space: pre;
+  font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #d8d8d8;
+  background: #16161a;
+  border: 1px solid #2c2c31;
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+/* Measured to size the shell's grid to the panel; never visible. Lives outside
+   the transcript (its digits would otherwise be extracted as terminal output),
+   so it carries the screen's font itself rather than inheriting it. */
+.term-probe {
+  position: absolute;
+  top: 0;
+  left: 0;
+  visibility: hidden;
+  pointer-events: none;
+  white-space: pre;
+  font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.term-dead {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: #a06000;
+}
+.term-busy {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: #2c7a4b;
+}
+.term-bar {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 6px;
+}
+.term-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #111;
+  background: #fff;
+  border: 1px solid #cfcfd4;
+  border-radius: 6px;
+  padding: 6px 9px;
+}
+.term-input:focus {
+  outline: none;
+  border-color: #4c8bf5;
+  box-shadow: 0 0 0 2px rgba(76, 139, 245, 0.2);
+}
+.term-run {
+  flex: 0 0 auto;
+  font: 600 12px -apple-system, sans-serif;
+  color: #fff;
+  background: #4c8bf5;
+  border: 1px solid #4c8bf5;
+  border-radius: 6px;
+  padding: 6px 14px;
+  cursor: pointer;
+}
+.term-run:hover:not(:disabled) {
+  background: #3d7ae8;
+}
+.term-run:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.term-keys {
+  flex: 0 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+/* -- sidebar Terminal entry (a first-class "app", not a setting) ------ */
+.sb-term {
+  text-decoration: none;
+  cursor: pointer;
+}
+.sb-term:hover {
+  background: #ececef;
+}
+.sb-term.current {
+  background: #e4edff;
+}
+.sb-termicon {
+  flex: 0 0 auto;
+  width: 16px;
+  font: 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #6b7280;
+}
+.sb-tag {
+  flex: 0 0 auto;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #6b7280;
+  background: #e6e6ea;
+  border-radius: 6px;
+  padding: 1px 6px;
+}
+
+@media (prefers-color-scheme: dark) {
+  #compose,
+  #termpanel {
+    background: #202022;
+    border-color: #333;
+  }
+  .compose-input,
+  .term-input {
+    color: #eee;
+    background: #2a2a2d;
+    border-color: #444;
+  }
+  .compose-send,
+  .keycap {
+    color: #ddd;
+    background: #2a2a2d;
+    border-color: #444;
+  }
+  .compose-send:hover:not(:disabled),
+  .keycap:hover {
+    background: #34343a;
+    border-color: #5a6a8a;
+  }
+  .keycap:active {
+    background: #3d3d45;
+  }
+  .compose-send.primary {
+    color: #fff;
+    background: #4c8bf5;
+    border-color: #4c8bf5;
+  }
+  .compose-target.ok {
+    color: #6fcf97;
+  }
+  .compose-target.warn {
+    color: #e0a52e;
+  }
+  .term-toggle {
+    color: #ddd;
+  }
+  .term-panel-hint {
+    color: #777;
+  }
+  .term-head h1 {
+    color: #eee;
+  }
+  .term-head p {
+    color: #999;
+  }
+  .term-dead {
+    color: #e0a52e;
+  }
+  .term-busy {
+    color: #6fcf97;
+  }
+  .sb-term:hover {
+    background: #2a2a2d;
+  }
+  .sb-term.current {
+    background: #2b3a5e;
+  }
+  .sb-termicon,
+  .sb-tag {
+    color: #999;
+  }
+  .sb-tag {
+    background: #333338;
+  }
+}

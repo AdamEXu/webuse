@@ -35,6 +35,8 @@ from Quartz import (
     kCGWindowListOptionOnScreenOnly,
 )
 
+from .cocoa import pooled
+
 kAXValueCGPointType = 1
 kAXValueCGSizeType = 2
 
@@ -138,6 +140,7 @@ def _resolve_by_frame(pid: int, window_id: int):
     return best
 
 
+@pooled
 def list_windows(pid: int) -> list[dict]:
     """The app's AXWindows as [{window_id, title, focused, minimized}].
     window_id is None only when neither the bridge nor the frame fallback can
@@ -158,6 +161,7 @@ def list_windows(pid: int) -> list[dict]:
     return out
 
 
+@pooled
 def resolve_window(pid: int, window_id: int | None = None):
     """AXWindow element for (pid, window_id). window_id None keeps today's
     precedence (AXFocusedWindow -> AXMainWindow -> AXWindows[0]); an explicit id is
@@ -175,6 +179,7 @@ def resolve_window(pid: int, window_id: int | None = None):
     return _resolve_by_frame(pid, window_id)
 
 
+@pooled
 def live_origin(pid: int, window_id: int | None = None) -> tuple[float, float] | None:
     """CURRENT top-left of the addressed window, read live from AX. Snapshot
     origins go stale the moment the window moves — coordinate actions must
@@ -184,6 +189,7 @@ def live_origin(pid: int, window_id: int | None = None) -> tuple[float, float] |
     return (g[0], g[1]) if g is not None else None
 
 
+@pooled
 def raise_window(pid: int, window_id: int | None) -> bool:
     """AXRaise a specific window to the front (Accessibility, not HID). No-op-safe
     when the window can't be resolved."""

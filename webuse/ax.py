@@ -21,6 +21,7 @@ from Quartz import (
 )
 
 from . import windows
+from .cocoa import pooled
 
 kAXValueCGPointType = 1
 kAXValueCGSizeType = 2
@@ -240,6 +241,7 @@ def _enable_manual_ax(pid: int) -> None:
     AXUIElementSetAttributeValue(windows.app_element(pid), "AXManualAccessibility", True)
 
 
+@pooled
 def snapshot(pid: int, window_id: int | None = None) -> dict:
     """Walk the addressed window of `pid` (window_id None => focused/main-window
     precedence). Returns window info + raw nodes, and registers every element under
@@ -380,6 +382,7 @@ def _observe(el):
     return (_coerce(_attr(el, "AXValue")), _attr(el, "AXSelected"))
 
 
+@pooled
 def perform(pid: int, el_id: str, action: str, value=None, window_id: int | None = None) -> dict:
     el = _lookup(pid, el_id, window_id)
     if el is None:
@@ -449,18 +452,40 @@ def focus_element(pid: int, el_id: str, window_id: int | None = None) -> bool:
 _EDITABLE_ROLES = {"AXTextField", "AXTextArea", "AXSearchField", "AXComboBox", "AXWebArea"}
 
 
-def focused_editable(pid: int) -> bool:
-    """True when the app's keyboard focus sits on something that accepts typed
-    text — a text-entry role, or any element with a writable AXValue. Guards
-    `type` with no target id from injecting keystrokes blind."""
+def focused_info(pid: int) -> dict | None:
+    """Describe where the app's keyboard focus sits — role, label, current value
+    and whether it accepts typed text. None when nothing is focused. Lets a
+    client show what `type` would land in instead of injecting text blind."""
     el = _attr(windows.app_element(pid), "AXFocusedUIElement")
     if el is None:
-        return False
+        return None
     role = _attr(el, "AXRole")
-    if role is not None and str(role) in _EDITABLE_ROLES:
-        return True
-    err, settable = AXUIElementIsAttributeSettable(el, "AXValue", None)
-    return err == 0 and bool(settable)
+    role = str(role) if role is not None else ""
+    editable = role in _EDITABLE_ROLES
+    if not editable:
+        err, settable = AXUIElementIsAttributeSettable(el, "AXValue", None)
+        editable = err == 0 and bool(settable)
+    label = (
+        _attr(el, "AXTitle")
+        or _attr(el, "AXDescription")
+        or _attr(el, "AXPlaceholderValue")
+        or ""
+    )
+    value = _attr(el, "AXValue")
+    return {
+        "role": role,
+        "label": str(label)[:120],
+        # Only mirror text values; a slider/checkbox AXValue is a number or bool.
+        "value": str(value)[:200] if isinstance(value, str) else None,
+        "editable": bool(editable),
+    }
+
+
+def focused_editable(pid: int) -> bool:
+    """True when the app's keyboard focus accepts typed text. Guards `type` with
+    no target id from injecting keystrokes blind."""
+    info = focused_info(pid)
+    return bool(info and info["editable"])
 
 
 def _scroll_area_at(pid: int, gx: float, gy: float, window_id: int | None = None):

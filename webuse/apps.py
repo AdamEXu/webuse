@@ -71,7 +71,10 @@ _ENUM_SRC = (
     "if a.activationPolicy()==0]))"
 )
 
+from .cocoa import data_bytes, pooled
 
+
+@pooled
 def _running_apps() -> list[dict]:
     """Live running regular-app list (fresh on any thread) — same shape/order the
     SSE feed pushes. Falls back to the in-process (possibly stale) list if the
@@ -151,6 +154,7 @@ _catalog_at = 0.0
 _catalog_lock = threading.Lock()
 
 
+@pooled
 def _installed_apps() -> list[dict]:
     """Installed catalog (TTL-cached) with fresh running/pid flags per call."""
     global _catalog_cache, _catalog_at
@@ -186,6 +190,7 @@ def icon_png(pid: int, size: int = _ICON_SIZE) -> bytes | None:
     return png
 
 
+@pooled
 def _render_icon(pid: int, size: int) -> bytes | None:
     app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
     img = app.icon() if app is not None else None
@@ -206,7 +211,7 @@ def _render_icon(pid: int, size: int) -> bytes | None:
     )
     NSGraphicsContext.restoreGraphicsState()
     data = rep.representationUsingType_properties_(NSBitmapImageFileTypePNG, {})
-    return bytes(data) if data else None
+    return data_bytes(data) if data else None
 
 
 # -- open --------------------------------------------------------------------
@@ -225,6 +230,7 @@ def _resolve_bundle_id(bundle_id=None, path=None, name=None) -> str | None:
     return None
 
 
+@pooled
 def _open_app(bundle_id=None, path=None, name=None) -> dict:
     bid = _resolve_bundle_id(bundle_id, path, name)
     if not bid and not (path or name):

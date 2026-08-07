@@ -25,6 +25,8 @@ from Quartz import (
     kCGWindowListOptionOnScreenOnly,
 )
 
+from .cocoa import data_bytes, pooled
+
 
 class CaptureError(RuntimeError):
     pass
@@ -223,12 +225,18 @@ class WindowCapture:
         )
         if data is None:
             raise CaptureError("JPEG encode failed")
-        return bytes(data)
+        return data_bytes(data)
 
+    @pooled
     def _next_frame(self) -> bytes:
         """One capture step: re-resolve if the AX window moved/resized, then grab
         a JPEG. Blocking (SCK/AX + time-boxed screenshot up to ~10s) — run off the
-        event loop via run_in_executor, never inline in the async generator."""
+        event loop via run_in_executor, never inline in the async generator.
+
+        Pooled: this runs on an executor thread, and the CGImage behind each frame
+        is autoreleased — without a pool to drain, every frame stays resident for
+        the life of the process (see pool.pooled). The JPEG returned is a `bytes`
+        copy, so it outlives the drain."""
         if self.get_frame and self._resolved_frame:
             f = self.get_frame()
             if f and any(abs(a - b) > 1.0 for a, b in zip(f, self._resolved_frame)):

@@ -102,6 +102,40 @@ export interface OpenResult {
   [k: string]: unknown;
 }
 
+// Where the app's keyboard focus sits — what typed text will land in.
+export interface FocusInfo {
+  role: string;
+  label: string;
+  value: string | null;
+  editable: boolean;
+}
+
+// A terminal session's rendered state. `text` is scrollback + viewport (what a
+// human sees after scrolling up); `screen` is the viewport alone.
+export interface TermSnapshot {
+  id: string;
+  text: string;
+  screen: string[];
+  cursor: [number, number];
+  cols: number;
+  rows: number;
+  version: number;
+  idle_ms: number;
+  busy: boolean; // a command still owns the terminal (not just "output went quiet")
+  alive: boolean;
+  exit_code: number | null;
+  settled?: boolean;
+}
+
+export interface TermInput {
+  value?: string;
+  key?: string;
+  enter?: boolean;
+  wait?: boolean;
+  quiet_ms?: number;
+  timeout_ms?: number;
+}
+
 // ---- endpoint helpers ----------------------------------------------------
 
 export const API = {
@@ -112,6 +146,11 @@ export const API = {
   permissionsRequest: "/api/permissions/request",
   activate: "/api/activate",
   action: "/api/action",
+  term: (sid: string) => `/api/term/${sid}`,
+  termInput: (sid: string) => `/api/term/${sid}/input`,
+  termResize: (sid: string) => `/api/term/${sid}/resize`,
+  termEvents: (sid: string) => `/api/term/${sid}/events`,
+  focus: (handle: string) => `/app/${handle}/focus`,
   windows: (pid: number) => `/app/${pid}/windows`,
   icon: (pid: number) => `/app/${pid}/icon`,
   menu: (handle: string) => `/app/${handle}/menu`,

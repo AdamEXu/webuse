@@ -22,11 +22,10 @@ _PROXY_HEADERS = (
 )
 
 
-# Set once a public tunnel (tinyfi.sh) is open. A raw `ssh -R` forward delivers
-# every remote request to localhost with an attacker-controllable Host header and
-# no proxy markers, so it is indistinguishable from a direct local request — the
-# ONLY safe rule while exposed is: trust nothing without the token. main.py calls
-# mark_tunnel_active() after starting the tunnel.
+# Set once the public Cloudflare tunnel is open. The tunnel delivers every remote
+# request to localhost, and we don't want the localhost shortcut to hinge on
+# proxy headers staying trustworthy — while exposed, the only safe rule is: trust
+# nothing without the token. main.py calls mark_tunnel_active() after starting it.
 _tunnel_active = False
 
 

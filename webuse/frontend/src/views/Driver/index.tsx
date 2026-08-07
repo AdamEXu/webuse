@@ -2,7 +2,9 @@ import { useCallback, useRef } from "react";
 import { useParams } from "react-router-dom";
 import { API, parseHandle, type Step } from "../../api";
 import { useDriver, type DriverRefs } from "./useDriver";
+import Compose from "./Compose";
 import Menubar from "./Menubar";
+import TerminalPanel from "./TerminalPanel";
 
 // The hidden agent-note (agents read it): how to drive this page over
 // POST /api/action. Ported from APP_PAGE, lightly adjusted for the SPA.
@@ -29,7 +31,16 @@ function agentNote(pid: number, windowId: number | null): string {
     `On failure the response has "failed_step"; it always includes per-step "results" ` +
     `(each with "point":[x,y] where it landed) and "dom" — the fresh post-action ghost ` +
     `DOM ({window, truncated, nodes}) — so you act and observe in one round trip. ` +
-    `Content updates live; re-read after acting.`
+    `Content updates live; re-read after acting. ` +
+    `IF YOU CAN ONLY CLICK AND TYPE IN TEXT BOXES, you do not need any of the above: ` +
+    `this page has two editable inputs of its own. (1) The COMPOSE BAR under the app — ` +
+    `click the app's text field first, then type into the compose box and click "Send" ` +
+    `(or "Send ↵" to type and press Return). It shows which control the app's keyboard ` +
+    `focus is on, and next to it are buttons for Enter/Tab/Esc/arrows/⌘A/⌘C/⌘V — the ` +
+    `keys typing alone can't express. (2) A real zsh TERMINAL stacked below it: type a ` +
+    `command, click "Run", and read the output that appears above the box (it updates by ` +
+    `itself). PREFER THE TERMINAL over clicking the GUI for anything a command can do — ` +
+    `volume, files, opening URLs, the clipboard.`
   );
 }
 
@@ -86,6 +97,8 @@ function Stage({ handle }: { handle: string }) {
             </div>
           </div>
         </div>
+        <Compose handle={handle} />
+        <TerminalPanel />
       </main>
       <div id="offscreen" ref={off} />
     </>

@@ -107,6 +107,7 @@ export default function Sidebar({
   // highlighted; on /app/:handle we parse pid[.window_id] for the current marks.
   const appMatch = useMatch("/app/:handle");
   const onInfo = !!useMatch("/info");
+  const onTerminal = !!useMatch("/terminal");
   const active = appMatch?.params.handle
     ? parseHandle(appMatch.params.handle)
     : null;
@@ -193,6 +194,18 @@ export default function Sidebar({
     <aside id="sidebar">
       <Link id="sb-home" className={onInfo ? "current" : ""} to="/info">
         Info
+      </Link>
+
+      {/* Terminal is a first-class "app": a real zsh session, listed alongside the
+          real ones because it's an alternative to driving a GUI, not a setting.
+          The same session is also stacked under every app page. */}
+      <Link
+        className={"sb-nav sb-term" + (onTerminal ? " current" : "")}
+        to="/terminal"
+      >
+        <span className="sb-termicon">›_</span>
+        <span className="sb-name">Terminal</span>
+        <span className="sb-tag">zsh</span>
       </Link>
 
       {/* Full Screen — deferred: reserved slot only, no behavior yet. */}

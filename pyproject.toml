@@ -9,6 +9,7 @@ dependencies = [
     "pyobjc-framework-applicationservices>=12.2.1",
     "pyobjc-framework-quartz>=12.2.1",
     "pyobjc-framework-screencapturekit>=12.2.1",
+    "pyte>=0.8.2",
     "uvicorn>=0.51.0",
     "websockets>=16.1",
 ]
