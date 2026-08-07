@@ -1,0 +1,577 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============================================================
+   Global reset (ported from the app page). The Info screen is styled
+   with self-contained Tailwind utilities; the driver chrome below is
+   scoped to #shell.
+   ============================================================ */
+* {
+  box-sizing: border-box;
+}
+html,
+body,
+#root {
+  height: 100%;
+}
+body {
+  margin: 0;
+  font: 13px -apple-system, sans-serif;
+}
+
+/* ============================================================
+   APP SHELL — persistent left sidebar + a #content area that swaps
+   between the Info screen and app drivers via the router Outlet.
+   ============================================================ */
+#shell {
+  display: flex;
+  height: 100vh;
+}
+/* The area right of the sidebar; whatever the route renders mounts here and
+   must be free to flex to full height (the Driver's #main fills it). */
+#content {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+#sidebar {
+  flex: 0 0 210px;
+  width: 210px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: #f5f5f7;
+  border-right: 1px solid #d0d0d0;
+  user-select: none;
+  -webkit-user-select: none;
+}
+#sb-home {
+  display: block;
+  flex: 0 0 auto;
+  padding: 8px 12px;
+  color: #4c8bf5;
+  text-decoration: none;
+  font-weight: 600;
+  border-bottom: 1px solid #e2e2e5;
+  background: #f5f5f7;
+}
+#sb-home:hover {
+  background: #ececef;
+}
+#sb-home.current {
+  background: #e4edff;
+}
+/* Reserved navigation slot (e.g. the deferred "Full Screen" entry). */
+.sb-nav {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  padding: 6px 12px;
+  font-weight: 600;
+  color: #333;
+  border-bottom: 1px solid #e2e2e5;
+}
+.sb-nav.disabled {
+  color: #aaa;
+  cursor: default;
+}
+.sb-nav .sb-name {
+  flex: 1 1 auto;
+}
+.soon {
+  flex: 0 0 auto;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #999;
+  background: #e6e6ea;
+  border-radius: 6px;
+  padding: 1px 6px;
+}
+/* Running-apps list: the growing, scrollable middle of the sidebar. */
+#sb-apps {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px 0;
+}
+.sb-approw {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.sb-approw:hover {
+  background: #ececef;
+}
+.sb-approw.current {
+  background: #e4edff;
+}
+.sb-caret {
+  width: 12px;
+  flex: 0 0 12px;
+  text-align: center;
+  color: #999;
+  font-size: 10px;
+}
+.sb-icon {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 18px;
+  border-radius: 4px;
+}
+.sb-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sb-wins {
+  padding-left: 4px;
+}
+.sb-win {
+  display: block;
+  padding: 4px 8px 4px 34px;
+  color: #333;
+  text-decoration: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 12px;
+}
+.sb-win:hover {
+  background: #ececef;
+}
+.sb-win.current {
+  background: #4c8bf5;
+  color: #fff;
+}
+.sb-win.min {
+  opacity: 0.55;
+  font-style: italic;
+}
+.sb-empty {
+  padding: 4px 8px 4px 34px;
+  color: #aaa;
+  font-size: 12px;
+}
+/* "Show Closed Apps" — collapsible catalog of installed, not-running apps. */
+#sb-closed {
+  flex: 0 0 auto;
+  border-top: 1px solid #e2e2e5;
+}
+.sb-closed-summary {
+  padding: 8px 12px;
+  cursor: pointer;
+  color: #4c8bf5;
+  font-weight: 600;
+  list-style: none;
+}
+.sb-closed-summary::-webkit-details-marker {
+  display: none;
+}
+.sb-closed-list {
+  max-height: 240px;
+  overflow-y: auto;
+  padding-bottom: 4px;
+}
+.sb-closed-app {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px 3px 12px;
+}
+.sb-closed-name {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #333;
+}
+.sb-open {
+  flex: 0 0 auto;
+  font: inherit;
+  font-size: 11px;
+  padding: 2px 8px;
+  cursor: pointer;
+  border: 1px solid #4c8bf5;
+  border-radius: 6px;
+  background: #fff;
+  color: #4c8bf5;
+}
+.sb-open:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+/* Footer: the debug toggle (outlines the ghost DOM everywhere). */
+#sb-footer {
+  flex: 0 0 auto;
+  border-top: 1px solid #e2e2e5;
+  padding: 8px 12px;
+}
+.sb-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+.sb-toggle-label {
+  flex: 1 1 auto;
+  color: #333;
+}
+.sb-switch {
+  position: relative;
+  flex: 0 0 auto;
+  width: 34px;
+  height: 20px;
+}
+.sb-switch input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+  margin: 0;
+}
+.sb-slider {
+  position: absolute;
+  inset: 0;
+  border-radius: 20px;
+  background: #c8c8ce;
+  transition: background 0.15s ease;
+}
+.sb-slider::before {
+  content: "";
+  position: absolute;
+  left: 2px;
+  top: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+  transition: transform 0.15s ease;
+}
+.sb-switch input:checked + .sb-slider {
+  background: #4c8bf5;
+}
+.sb-switch input:checked + .sb-slider::before {
+  transform: translateX(14px);
+}
+.sb-switch input:focus-visible + .sb-slider {
+  outline: 2px solid #4c8bf5;
+  outline-offset: 2px;
+}
+#main {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+/* Fit the streamed feed into the area left of the sidebar / below the menu bar. */
+#stagewrap {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  background: #111;
+}
+/* #stagebox is the on-screen (scaled) footprint; #stage keeps native window points
+   and is shrunk into it with a CSS transform, so the ghost overlay stays aligned. */
+#stagebox {
+  position: relative;
+  overflow: hidden;
+}
+#stage {
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform-origin: top left;
+  overflow: hidden;
+  outline: none;
+  touch-action: none;
+}
+/* The feed fills the native-sized #stage and NEVER stretches: object-fit:contain
+   letterboxes if a just-arrived frame's aspect differs from the current window
+   dims (that mismatch is transient — the next snapshot corrects winW/winH). */
+#screen {
+  display: block;
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+@media (prefers-color-scheme: dark) {
+  #sidebar {
+    background: #1e1e20;
+    border-color: #3a3a3d;
+  }
+  #sb-home {
+    background: #1e1e20;
+    border-color: #333;
+  }
+  #sb-home:hover,
+  .sb-approw:hover,
+  .sb-win:hover {
+    background: #2a2a2d;
+  }
+  #sb-home.current,
+  .sb-approw.current {
+    background: #2b3a5e;
+  }
+  .sb-win {
+    color: #ccc;
+  }
+  .sb-empty {
+    color: #666;
+  }
+  .sb-nav {
+    color: #ccc;
+    border-color: #333;
+  }
+  .sb-nav.disabled {
+    color: #666;
+  }
+  .soon {
+    color: #999;
+    background: #333338;
+  }
+  #sb-closed,
+  #sb-footer {
+    border-color: #333;
+  }
+  .sb-closed-name,
+  .sb-toggle-label {
+    color: #ccc;
+  }
+  .sb-open {
+    background: #2a2a2d;
+  }
+  .sb-slider {
+    background: #45454b;
+  }
+}
+/* The overlay container stays pointer-events:none so a click on EMPTY space falls
+   through to the stage and forwards as a coordinate HID click. Individual ghost
+   elements, however, ARE hit-test targets (pointer-events:auto) so a harness that
+   can only click real DOM nodes (not the bare stage) can click them — the delegated
+   handler forwards a real HID click at the cursor, or the element center. */
+#overlay {
+  position: absolute;
+  left: 0;
+  top: 0;
+  pointer-events: none;
+}
+.ghost {
+  position: absolute;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: transparent;
+  font: 13px -apple-system, sans-serif;
+  text-align: left;
+  cursor: default;
+  pointer-events: auto;
+  -webkit-appearance: none;
+  appearance: none;
+}
+.ghost:focus {
+  outline: none;
+  background: rgba(255, 255, 255, 0.01);
+}
+a.ghost {
+  text-decoration: none;
+}
+span.ghost {
+  pointer-events: none;
+  overflow: hidden;
+}
+input.ghost[type="checkbox"],
+input.ghost[type="radio"] {
+  opacity: 0.01;
+}
+/* Text-field mirrors are non-editable divs: clip long values to the field's box
+   (a div would otherwise grow/overflow where an input clipped) and show no
+   text-editing affordances — there is nothing to edit here. */
+div.ghost[role="textbox"] {
+  overflow: hidden;
+  white-space: pre;
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: default;
+}
+#offscreen {
+  position: absolute;
+  left: -10000px;
+  top: 0;
+  width: 600px;
+  overflow: hidden;
+}
+#offscreen .ghost {
+  position: static;
+  display: block;
+  color: #000;
+}
+#agent-note {
+  position: absolute;
+  left: -10000px;
+  top: 0;
+}
+#banner {
+  display: none;
+  position: fixed;
+  left: 0;
+  right: 0;
+  top: 0;
+  z-index: 10;
+  padding: 8px 12px;
+  background: #c0392b;
+  color: #fff;
+}
+body.gone #banner {
+  display: block;
+}
+#status {
+  display: none;
+  position: fixed;
+  right: 12px;
+  top: 12px;
+  z-index: 10;
+  padding: 6px 10px;
+  background: rgba(0, 0, 0, 0.75);
+  color: #fff;
+  border-radius: 6px;
+}
+/* Keyboard-capture indicator: shown only while the stage has focus, so the user
+   is never silently trapped — click it (or anywhere outside the stage) to release. */
+#kb {
+  display: none;
+  position: fixed;
+  right: 12px;
+  bottom: 12px;
+  z-index: 12;
+  padding: 6px 11px;
+  background: #1a7f37;
+  color: #fff;
+  border-radius: 20px;
+  font: 12px -apple-system, sans-serif;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+}
+body.capturing #kb {
+  display: block;
+}
+body.debug .ghost {
+  outline: 1px solid rgba(255, 0, 255, 0.8);
+  background: rgba(255, 0, 255, 0.06);
+}
+body.debug span.ghost {
+  outline-color: rgba(0, 160, 255, 0.8);
+  background: rgba(0, 160, 255, 0.05);
+}
+/* No in-page cursor: interaction is real HID input, so the actual system cursor
+   moves on the Mac and is captured in the stream. Nothing is faked here. */
+/* Web menu bar: the app's real menus, rendered client-side; only the chosen
+   item is sent to the app (as an AXPress). */
+#menubar {
+  display: flex;
+  gap: 1px;
+  background: #f5f5f7;
+  border-bottom: 1px solid #d0d0d0;
+  font: 13px -apple-system, sans-serif;
+  padding: 2px 6px;
+  position: relative;
+  z-index: 20;
+  user-select: none;
+  -webkit-user-select: none;
+  flex-wrap: wrap;
+}
+#menubar .top {
+  padding: 3px 10px;
+  border-radius: 5px;
+  cursor: default;
+}
+#menubar .top:hover,
+#menubar .top.open {
+  background: #dfe0e4;
+}
+.menu {
+  position: fixed;
+  min-width: 210px;
+  background: #fff;
+  border: 1px solid #c8c8c8;
+  border-radius: 8px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.2);
+  padding: 4px;
+  z-index: 40;
+  font: 13px -apple-system, sans-serif;
+}
+.menu .item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 26px;
+  padding: 4px 10px;
+  border-radius: 5px;
+  white-space: nowrap;
+}
+.menu .item:not(.disabled):hover {
+  background: #4c8bf5;
+  color: #fff;
+}
+.menu .item:not(.disabled):hover .sc {
+  color: #fff;
+}
+.menu .item.disabled {
+  color: #b3b3b3;
+}
+.menu .sep {
+  height: 1px;
+  background: #e3e3e3;
+  margin: 4px 8px;
+}
+.menu .lbl {
+  display: flex;
+  gap: 6px;
+}
+.menu .sc {
+  color: #999;
+  font-size: 12px;
+}
+.menu .item.sub .sc::after {
+  content: "▸";
+}
+@media (prefers-color-scheme: dark) {
+  #menubar {
+    background: #2a2a2c;
+    border-color: #444;
+    color: #eee;
+  }
+  #menubar .top:hover,
+  #menubar .top.open {
+    background: #3a3a3d;
+  }
+  .menu {
+    background: #2c2c2e;
+    border-color: #555;
+    color: #eee;
+  }
+  .menu .sep {
+    background: #444;
+  }
+}
