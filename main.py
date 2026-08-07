@@ -48,7 +48,8 @@ def main():
     if not ax.screen_recording():
         print("  ⚠ Screen Recording permission NOT granted — app streams will be black.")
     if not (ax.trusted() and ax.screen_recording()):
-        print(f"    Open http://{args.host}:{args.port} for guided setup.")
+        print("    Grant both in System Settings → Privacy & Security "
+              "(Accessibility, Screen Recording), then restart webuse.")
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 

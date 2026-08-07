@@ -27,10 +27,16 @@ uv sync
 
 ## Run
 
+Build the web frontend once (and after any frontend change), then start the server:
+
 ```sh
+cd webuse/frontend && pnpm install && pnpm build && cd ../..
 uv run python main.py            # http://127.0.0.1:8787
 uv run python main.py --port 9000 --host 127.0.0.1
 ```
+
+> **Frontend dev:** `cd webuse/frontend && pnpm dev` runs Vite with a proxy to the
+> Python server, for hot-reload work on the SPA.
 
 Then open **http://127.0.0.1:8787** and pick an app.
 
@@ -51,7 +57,6 @@ During development the permissions attach to your **terminal** (or whatever proc
 | `/` | Home: permission checklist + a live grid of running apps (updates as you open/quit apps). |
 | `/app/{pid}` | A single app rendered as a ghost DOM over its live screen stream. |
 | `/app/{pid}?debug=1` | Same, with every ghost element outlined — a "show layout bounds" for macOS. |
-| `/workspace` | Multi-app view: a sidebar to switch apps, multiple app panes at once, per-window **Focus**, and **Arrange** to tile the real windows to the layout. |
 
 **Sharing with a cloud agent (Cloudflare Tunnel).** The server prints an auth token at startup:
 
@@ -81,8 +86,6 @@ All routes accept the token via `?token=` (once, to set the cookie) when not on 
 | `GET /api/apps` | `?installed=1` for the full catalog | Running apps (or all installed apps with launch info). |
 | `POST /api/apps/open` | `{bundle_id?}` / `{name?}` / `{path?}` | Launch an app; returns its `pid`. |
 | `GET /api/apps/events` | — | SSE: running-app launches/quits. |
-| `POST /api/workspace/focus` | `{pid}` | Raise + activate an app's window. |
-| `POST /api/workspace/arrange` | `{pids:[…], cols?}` | Tile the given apps' native windows to a grid. |
 
 **Actions** (`action` field):
 - `press` — `AXPress` the element with `id` (a real semantic click; works on off-screen elements).
@@ -103,10 +106,12 @@ browser agent ─HTTP→ FastAPI (webuse/server.py)
                         ├─ dom.py       map AX roles → HTML tags
                         ├─ capture.py   ScreenCaptureKit → MJPEG (CGWindowList fallback; captures occluded / off-Space windows)
                         ├─ watch.py     per-app AXObserver on a background CFRunLoop → SSE push (instant DOM updates)
-                        ├─ workspace.py multi-app page + sidebar
-                        ├─ winctl.py    focus / move / tile native windows (settable AXPosition/AXSize)
                         └─ apps.py      installed-app catalog, launch, live running-app SSE
 ```
+
+The single-page frontend (React, built with Vite) lives in `webuse/frontend/` and
+builds to `webuse/frontend/dist`, which the server serves statically with a
+client-side-routing fallback.
 
 The page layers an absolutely-positioned, transparent HTML element over each native control at its
 real screen box. Reads come from the DOM/SSE; the video is just for the agent's screenshots and for
