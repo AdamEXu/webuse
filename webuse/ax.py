@@ -8,9 +8,11 @@ from ApplicationServices import (
     AXIsProcessTrusted,
     AXUIElementCopyActionNames,
     AXUIElementCopyAttributeValue,
-    AXUIElementCreateApplication,
+    AXUIElementCopyMultipleAttributeValues,
+    AXUIElementIsAttributeSettable,
     AXUIElementPerformAction,
     AXUIElementSetAttributeValue,
+    AXValueGetType,
     AXValueGetValue,
 )
 from Quartz import (
@@ -22,6 +24,9 @@ from . import windows
 
 kAXValueCGPointType = 1
 kAXValueCGSizeType = 2
+# In a batched read, a per-attribute failure comes back as an AXValue of this
+# type (holding the AXError) rather than the attribute's value.
+kAXValueAXErrorType = 5
 
 MAX_NODES = 4000
 # Above this many children, prefer a container's visible-subset attribute
@@ -99,6 +104,7 @@ def is_running(pid: int) -> bool:
 
 def forget(pid: int) -> None:
     """Drop all state for every window of a pid (call when a watched app exited)."""
+    _manual_ax_pids.discard(pid)  # a relaunch reusing the pid must be re-poked
     with _id_lock:
         for d in (_counters, _ids_by_el, _els_by_id, _seen_at, _last_window):
             for k in [k for k in d if k[0] == pid]:
@@ -148,8 +154,22 @@ def _attr(el, name):
     return val if err == 0 else None
 
 
-def _geom(el):
-    pos, size = _attr(el, "AXPosition"), _attr(el, "AXSize")
+def _attrs(el, names) -> dict:
+    """Read many attributes in ONE AX round-trip. The per-node walk cost is
+    dominated by IPC to the target app, so batching is ~len(names)x fewer calls.
+    Per-attribute failures come back as AXValue error placeholders — mapped to
+    None, exactly matching _attr's non-zero-err behavior."""
+    err, vals = AXUIElementCopyMultipleAttributeValues(el, names, 0, None)
+    if err != 0 or vals is None:  # whole-element failure: every attribute missing
+        return dict.fromkeys(names)
+    return {
+        n: (None if v is None or AXValueGetType(v) == kAXValueAXErrorType else v)
+        for n, v in zip(names, vals)
+    }
+
+
+def _unwrap_geom(pos, size):
+    """Unbox AXPosition/AXSize AXValues into (x, y, w, h), or None."""
     if pos is None or size is None:
         return None
     ok1, p = AXValueGetValue(pos, kAXValueCGPointType, None)
@@ -159,17 +179,28 @@ def _geom(el):
     return (float(p.x), float(p.y), float(s.width), float(s.height))
 
 
-def _far_offscreen(geom, wx, wy, ww, wh) -> bool:
-    """True if `geom` lies more than one window-dimension beyond the visible rect.
-    A tall scroll region (e.g. a playlist with thousands of rows) buries on-screen
-    chrome like a transport bar under a huge off-screen subtree; walking it all
-    exhausts the node/time budget before the chrome is reached. Pruning subtrees
-    this far out keeps the budget for what's visible (plus ~one screen of
-    scroll-ahead in every direction). Case-agnostic: keyed only on geometry."""
+def _geom(el):
+    return _unwrap_geom(_attr(el, "AXPosition"), _attr(el, "AXSize"))
+
+
+# Keep elements a little past the visible edge so controls straddling the fold and
+# minor geometry slop survive; anything fully beyond this is pruned.
+_OFFSCREEN_MARGIN = 24.0
+
+
+def _offscreen(geom, wx, wy, ww, wh) -> bool:
+    """True if `geom` lies (essentially) outside the visible window rect.
+    A tall scroll region (e.g. a playlist with thousands of rows) otherwise buries
+    on-screen chrome like a transport bar under a huge off-view subtree; walking it
+    all is slow and exhausts the node/time budget before the chrome is reached.
+    Pruning to the viewport keeps the snapshot fast and complete for what's actually
+    visible — agents scroll to reveal the rest. Case-agnostic: keyed only on
+    geometry."""
     gx, gy, gw, gh = geom
+    m = _OFFSCREEN_MARGIN
     return (
-        gx + gw < wx - ww or gx > wx + 2 * ww
-        or gy + gh < wy - wh or gy > wy + 2 * wh
+        gx + gw < wx - m or gx > wx + ww + m
+        or gy + gh < wy - m or gy > wy + wh + m
     )
 
 
@@ -184,10 +215,36 @@ def _coerce(v):
     return s if len(s) <= 200 else None
 
 
+# All the per-node attributes the walk needs, fetched in one batched IPC each.
+# AXChildren / visible-subset attributes stay separate: they're read conditionally
+# and their (possibly huge) arrays shouldn't ride along on every node.
+_NODE_ATTRS = [
+    "AXRole", "AXSubrole", "AXTitle", "AXDescription", "AXValue",
+    "AXPlaceholderValue", "AXHelp", "AXEnabled", "AXPosition", "AXSize",
+]
+
+# pids already asked to populate their AX tree (see _enable_manual_ax).
+_manual_ax_pids: set[int] = set()
+
+
+def _enable_manual_ax(pid: int) -> None:
+    """Ask the app to expose its full AX tree even with no assistive client
+    attached: Chromium/Electron apps gate web-content accessibility behind the
+    AXManualAccessibility attribute and otherwise present an empty web area.
+    Case-agnostic — apps that don't implement the attribute simply return an
+    AXError, which is ignored. Once per pid; the watcher's periodic re-walk
+    picks up the lazily populated tree."""
+    if pid in _manual_ax_pids:
+        return
+    _manual_ax_pids.add(pid)
+    AXUIElementSetAttributeValue(windows.app_element(pid), "AXManualAccessibility", True)
+
+
 def snapshot(pid: int, window_id: int | None = None) -> dict:
     """Walk the addressed window of `pid` (window_id None => focused/main-window
     precedence). Returns window info + raw nodes, and registers every element under
     the (pid, window_id) key so actions on that window can resolve ids later."""
+    _enable_manual_ax(pid)
     win = windows.resolve_window(pid, window_id)
     if win is None:
         raise LookupError(f"no accessible window for pid {pid}")
@@ -219,15 +276,16 @@ def snapshot(pid: int, window_id: int | None = None) -> dict:
             truncated = True
             break
         el = stack.pop()
-        role = _attr(el, "AXRole")
+        a = _attrs(el, _NODE_ATTRS)  # one IPC for all per-node attributes
+        role = a["AXRole"]
         if role is None:
             continue
-        geom = _geom(el)
+        geom = _unwrap_geom(a["AXPosition"], a["AXSize"])
         # Skip elements (and their subtrees) buried far outside the visible window:
         # a tall scroll region's off-screen rows would otherwise drain the walk
         # budget before on-screen chrome (e.g. a transport bar late in child order)
         # is reached. On-screen and near-fold content is always kept.
-        if geom is not None and _far_offscreen(geom, wx, wy, ww, wh):
+        if geom is not None and _offscreen(geom, wx, wy, ww, wh):
             continue
         # Prefer a container's on-screen subset over all its children. Any
         # heavily populated container that exposes a visible-subset attribute
@@ -254,18 +312,18 @@ def snapshot(pid: int, window_id: int | None = None) -> dict:
         err, action_names = AXUIElementCopyActionNames(el, None)
         actions = [str(a) for a in action_names] if err == 0 and action_names else []
         node_id = _intern(key, ids_by_el, els_by_id, seen_at, el, now)
-        title = _coerce(_attr(el, "AXTitle"))
-        desc = _coerce(_attr(el, "AXDescription"))
+        title = _coerce(a["AXTitle"])
+        desc = _coerce(a["AXDescription"])
         nodes.append(
             {
                 "id": node_id,
                 "role": str(role),
-                "subrole": _coerce(_attr(el, "AXSubrole")),
+                "subrole": _coerce(a["AXSubrole"]),
                 "label": title or desc or "",
-                "value": _coerce(_attr(el, "AXValue")),
-                "placeholder": _coerce(_attr(el, "AXPlaceholderValue")),
-                "help": _coerce(_attr(el, "AXHelp")),  # tooltip text (hover, read-only)
-                "enabled": _attr(el, "AXEnabled") in (None, True, 1),
+                "value": _coerce(a["AXValue"]),
+                "placeholder": _coerce(a["AXPlaceholderValue"]),
+                "help": _coerce(a["AXHelp"]),  # tooltip text (hover, read-only)
+                "enabled": a["AXEnabled"] in (None, True, 1),
                 "actions": actions,
                 "x": geom[0], "y": geom[1], "w": geom[2], "h": geom[3],
             }
@@ -301,24 +359,70 @@ def center(pid: int, el_id: str, window_id: int | None = None) -> tuple[float, f
     return (g[0] + g[2] / 2.0, g[1] + g[3] / 2.0)
 
 
+# AXError -> stable machine-readable reason (the codes that actually reach us).
+_AX_ERR_REASON = {
+    -25200: "failure",
+    -25201: "illegal_argument",
+    -25202: "invalid_element",
+    -25204: "cannot_complete",
+    -25205: "attribute_unsupported",
+    -25206: "action_unsupported",
+    -25208: "not_implemented",
+    -25211: "api_disabled",
+    -25212: "no_value",
+    -25214: "not_enough_precision",
+}
+
+
+def _observe(el):
+    """Observable control state (value + selection), captured before/after an
+    action so `changed` reports whether the action had a visible effect."""
+    return (_coerce(_attr(el, "AXValue")), _attr(el, "AXSelected"))
+
+
 def perform(pid: int, el_id: str, action: str, value=None, window_id: int | None = None) -> dict:
     el = _lookup(pid, el_id, window_id)
     if el is None:
-        return {"ok": False, "error": f"unknown element id {el_id} (stale snapshot?)"}
-    if action == "press":
-        err = AXUIElementPerformAction(el, "AXPress")
-        if err != 0:  # some controls (segmented/list rows) expose AXPick, not AXPress
-            e2, names = AXUIElementCopyActionNames(el, None)
-            if e2 == 0 and names and "AXPick" in [str(n) for n in names]:
-                err = AXUIElementPerformAction(el, "AXPick")
-    elif action == "confirm":
-        err = AXUIElementPerformAction(el, "AXConfirm")
+        return {"ok": False, "error": f"unknown element id {el_id} (stale snapshot?)",
+                "code": "stale_id"}
+    if action in ("press", "confirm"):
+        before = _observe(el)
+        if action == "press":
+            err = AXUIElementPerformAction(el, "AXPress")
+            if err != 0:  # some controls (segmented/list rows) expose AXPick, not AXPress
+                e2, names = AXUIElementCopyActionNames(el, None)
+                if e2 == 0 and names and "AXPick" in [str(n) for n in names]:
+                    err = AXUIElementPerformAction(el, "AXPick")
+        else:
+            err = AXUIElementPerformAction(el, "AXConfirm")
+        after = _observe(el)
+        result = {"ok": err == 0, "axerror": int(err)}
+        if any(v is not None for v in before + after):
+            # Element exposes readable state (checkbox/radio/menu/slider/…):
+            # report whether the action actually flipped it, honestly.
+            result["changed"] = after != before
+            result["verified"] = True
+        else:
+            result["verified"] = False  # plain button: delivery only, no readback
     elif action == "set_value":
         AXUIElementSetAttributeValue(el, "AXFocused", True)
-        err = AXUIElementSetAttributeValue(el, "AXValue", "" if value is None else str(value))
+        requested = "" if value is None else str(value)
+        err = AXUIElementSetAttributeValue(el, "AXValue", requested)
+        readback = _attr(el, "AXValue")  # what the app actually kept
+        result = {
+            "ok": err == 0,
+            "axerror": int(err),
+            # compare as strings: sliders/steppers read numbers back
+            "changed": ("" if readback is None else str(readback)) == requested,
+            "verified": True,
+        }
     else:
-        return {"ok": False, "error": f"unknown action {action!r}"}
-    result = {"ok": err == 0, "axerror": int(err)}
+        return {"ok": False, "error": f"unknown action {action!r}", "code": "unknown_action"}
+    if err != 0:
+        reason = _AX_ERR_REASON.get(int(err), "unknown")
+        result["error"] = f"AX action failed: {reason} (AXError {int(err)})"
+        result["reason"] = reason
+        result["code"] = reason
     geom, win = _geom(el), last_window(pid, window_id)
     if geom and win:  # post-action element center, window-relative (for cursors/agents)
         result["point"] = [
@@ -326,6 +430,37 @@ def perform(pid: int, el_id: str, action: str, value=None, window_id: int | None
             round(geom[1] + geom[3] / 2 - win["y"], 1),
         ]
     return result
+
+
+def focus_element(pid: int, el_id: str, window_id: int | None = None) -> bool:
+    """Put keyboard focus on a registered element (by id). True only when the
+    app both accepted the AXFocused write and reports the element focused
+    afterwards — callers fall back to a HID click when it refuses."""
+    el = _lookup(pid, el_id, window_id)
+    if el is None:
+        return False
+    if AXUIElementSetAttributeValue(el, "AXFocused", True) != 0:
+        return False
+    return _attr(el, "AXFocused") in (True, 1)
+
+
+# Roles that accept typed text. Keyed on AX role only (never on app identity);
+# anything else must prove editability via a settable AXValue.
+_EDITABLE_ROLES = {"AXTextField", "AXTextArea", "AXSearchField", "AXComboBox", "AXWebArea"}
+
+
+def focused_editable(pid: int) -> bool:
+    """True when the app's keyboard focus sits on something that accepts typed
+    text — a text-entry role, or any element with a writable AXValue. Guards
+    `type` with no target id from injecting keystrokes blind."""
+    el = _attr(windows.app_element(pid), "AXFocusedUIElement")
+    if el is None:
+        return False
+    role = _attr(el, "AXRole")
+    if role is not None and str(role) in _EDITABLE_ROLES:
+        return True
+    err, settable = AXUIElementIsAttributeSettable(el, "AXValue", None)
+    return err == 0 and bool(settable)
 
 
 def _scroll_area_at(pid: int, gx: float, gy: float, window_id: int | None = None):
@@ -369,7 +504,7 @@ def scroll(pid: int, gx: float, gy: float, dx: float, dy: float, window_id: int 
     fallback is intentionally omitted — it needs focus-stealing injection)."""
     area = _scroll_area_at(pid, gx, gy, window_id)
     if area is None:
-        return {"ok": False, "error": "no scroll area at point"}
+        return {"ok": False, "error": "no scroll area at point", "code": "no_scroll_area"}
     g = _geom(area) or (0.0, 0.0, 1000.0, 800.0)
     moved = False
     vbar, hbar = _attr(area, "AXVerticalScrollBar"), _attr(area, "AXHorizontalScrollBar")

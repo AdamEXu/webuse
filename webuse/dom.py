@@ -4,15 +4,27 @@ TEXT_ROLES = {"AXTextField", "AXTextArea", "AXComboBox"}
 
 
 def classify(n: dict) -> dict | None:
-    """Return render info for a raw AX node, or None if it shouldn't render."""
+    """Return render info for a raw AX node, or None if it shouldn't render.
+    Every rendered node carries the raw AX role so agents can tell apart
+    controls that collapse to the same kind/tag (slider vs stepper vs tab…)."""
+    info = _classify(n)
+    if info is not None:
+        info["role"] = n["role"]
+    return info
+
+
+def _classify(n: dict) -> dict | None:
     role, sub = n["role"], n.get("subrole")
     actions = n.get("actions") or []
     v = n.get("value")
 
     if role in TEXT_ROLES or sub == "AXSearchField":
+        # Rendered as a non-editable <div role="textbox"> mirror, never a real
+        # <input>/<textarea>: an editable ghost would silently swallow programmatic
+        # typing that belongs to the app (all text entry must be real HID).
         return {
             "kind": "text",
-            "tag": "textarea" if role == "AXTextArea" else "input",
+            "tag": "div",
             "value": v if isinstance(v, str) else ("" if v is None else str(v)),
         }
     if role == "AXCheckBox":

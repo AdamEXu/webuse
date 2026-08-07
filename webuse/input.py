@@ -74,7 +74,9 @@ def _post_mouse(etype, gx, gy, button_const, click_state):
 
 
 def activate(pid: int) -> None:
-    """Bring the app to the foreground so HID events reach it, then settle."""
+    """Bring the app to the foreground so HID events reach it, then settle.
+    Best-effort: activation is fire-and-settle (a background process can't force
+    the frontmost app on modern macOS, so never block or refuse on it)."""
     app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
     if app is not None:
         app.activateWithOptions_(1 << 1)  # NSApplicationActivateIgnoringOtherApps
@@ -150,8 +152,18 @@ def key_tap(code: int, mods: int = 0) -> None:
 def type_text(s: str) -> None:
     """Type literal text as a bounded sequence of key taps. Each character is
     delivered by its unicode string on the key event, so it's layout-robust and
-    handles any character regardless of the physical keymap."""
+    handles any character regardless of the physical keymap. Newlines and tabs
+    are delivered as real Return/Tab key taps — as a bare unicode control char
+    many apps ignore them entirely."""
     for ch in s:
+        if ch in ("\n", "\r"):
+            key_tap(KEYMAP["Enter"])
+            time.sleep(0.004)
+            continue
+        if ch == "\t":
+            key_tap(KEYMAP["Tab"])
+            time.sleep(0.004)
+            continue
         down = CGEventCreateKeyboardEvent(_SOURCE, 0, True)
         CGEventKeyboardSetUnicodeString(down, len(ch), ch)
         CGEventPost(kCGHIDEventTap, down)

@@ -9,8 +9,9 @@ Mirrors watch.py's threading/SSE registry (one module-global AppsWatcher, no per
 and ax.list_apps()'s dict shape / activationPolicy==0 filter. Polling (~1.5s) is the
 correctness backbone; NSWorkspace launch/terminate notifications are a latency
 accelerator that shortcut the poll sleep, exactly like watch.py's safety-net stance.
-No per-app/host/bundle special-casing — the /Applications-family scan is a generic
-Spotlight-off fallback.
+No per-app/host/bundle special-casing — the installed catalog is a generic top-level
+scan of the Launchpad-visible /Applications-family directories (no Spotlight/mdfind,
+which surfaces hidden framework/debug bundles Launchpad never shows).
 """
 
 import asyncio
@@ -36,7 +37,7 @@ from AppKit import (
     NSZeroRect,
 )
 
-CATALOG_TTL_S = 60.0  # mdfind + ~400 NSBundle reads is the cost; cache the catalog
+CATALOG_TTL_S = 60.0  # per-dir glob + NSBundle reads is the cost; cache the catalog
 POLL_S = 1.5          # correctness backbone: catch every launch/terminate within this
 OPEN_POLL_S = 0.2     # launch-and-poll cadence
 OPEN_TIMEOUT_S = 6.0
@@ -114,17 +115,6 @@ def _running_pids_for_bundle(bid: str) -> set[int]:
     }
 
 
-def _mdfind_bundles() -> list[str]:
-    try:
-        out = subprocess.run(
-            ["mdfind", "kMDItemContentTypeTree == 'com.apple.application-bundle'c"],
-            capture_output=True, text=True, timeout=10,
-        ).stdout
-    except Exception:
-        return []
-    return [ln for ln in out.splitlines() if ln.endswith(".app")]
-
-
 def _scan_bundles() -> list[str]:
     paths: list[str] = []
     for d in SCAN_DIRS:
@@ -136,7 +126,7 @@ def _build_catalog() -> list[dict]:
     """Full installed catalog sans running/pid flags (those recomputed per call)."""
     seen: set[str] = set()
     apps: list[dict] = []
-    for path in _mdfind_bundles() + _scan_bundles():
+    for path in _scan_bundles():
         try:
             real = os.path.realpath(path)
         except OSError:

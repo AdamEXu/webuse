@@ -10,7 +10,7 @@ The AX->CGWindowID bridge is the private ApplicationServices symbol
 (spike-confirmed callable via ctypes). When it's unavailable we fall back to
 matching the AXWindow to the on-screen CGWindowList by frame + title.
 
-Self-contained (own AX attribute reader, like winctl.py) so `ax` can import this
+Self-contained (own AX attribute reader) so `ax` can import this
 without a cycle."""
 
 import ctypes
@@ -23,6 +23,11 @@ from ApplicationServices import (
     AXUIElementPerformAction,
     AXValueGetValue,
 )
+
+try:  # older PyObjC builds may not expose it; then the global default applies
+    from ApplicationServices import AXUIElementSetMessagingTimeout
+except ImportError:
+    AXUIElementSetMessagingTimeout = None
 from Quartz import (
     CGWindowListCopyWindowInfo,
     kCGNullWindowID,
@@ -57,6 +62,20 @@ def _load_get_window():
 
 _GET_WINDOW = _load_get_window()
 
+# Per-app AX messaging timeout. The system default (~6s) lets ONE hung app
+# stall a walk long enough to truncate the whole tree; a short timeout turns a
+# hung reply into a per-attribute None (callers already treat errors as None).
+MESSAGING_TIMEOUT_S = 0.75
+
+
+def app_element(pid: int):
+    """App-level AXUIElement with the short messaging timeout applied. Every
+    app-element creation funnels through here so no path forgets the timeout."""
+    el = AXUIElementCreateApplication(pid)
+    if AXUIElementSetMessagingTimeout is not None:
+        AXUIElementSetMessagingTimeout(el, MESSAGING_TIMEOUT_S)
+    return el
+
 
 def _attr(el, name):
     err, val = AXUIElementCopyAttributeValue(el, name, None)
@@ -83,7 +102,7 @@ def ax_window_id(el) -> int | None:
 
 
 def _app_windows(pid: int):
-    return list(_attr(AXUIElementCreateApplication(pid), "AXWindows") or [])
+    return list(_attr(app_element(pid), "AXWindows") or [])
 
 
 def _cg_window_info(window_id: int) -> dict | None:
@@ -123,7 +142,7 @@ def list_windows(pid: int) -> list[dict]:
     """The app's AXWindows as [{window_id, title, focused, minimized}].
     window_id is None only when neither the bridge nor the frame fallback can
     identify it (still listed, just not directly addressable)."""
-    app = AXUIElementCreateApplication(pid)
+    app = app_element(pid)
     focused = _attr(app, "AXFocusedWindow")
     out = []
     for w in _attr(app, "AXWindows") or []:
@@ -143,7 +162,7 @@ def resolve_window(pid: int, window_id: int | None = None):
     """AXWindow element for (pid, window_id). window_id None keeps today's
     precedence (AXFocusedWindow -> AXMainWindow -> AXWindows[0]); an explicit id is
     matched via the bridge, then the frame/title fallback."""
-    app = AXUIElementCreateApplication(pid)
+    app = app_element(pid)
     if window_id is None:
         win = _attr(app, "AXFocusedWindow") or _attr(app, "AXMainWindow")
         if win is None:
@@ -154,6 +173,15 @@ def resolve_window(pid: int, window_id: int | None = None):
         if ax_window_id(w) == window_id:
             return w
     return _resolve_by_frame(pid, window_id)
+
+
+def live_origin(pid: int, window_id: int | None = None) -> tuple[float, float] | None:
+    """CURRENT top-left of the addressed window, read live from AX. Snapshot
+    origins go stale the moment the window moves — coordinate actions must
+    resolve against where the window is now."""
+    win = resolve_window(pid, window_id)
+    g = _geom(win) if win is not None else None
+    return (g[0], g[1]) if g is not None else None
 
 
 def raise_window(pid: int, window_id: int | None) -> bool:
