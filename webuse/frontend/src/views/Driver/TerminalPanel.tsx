@@ -15,8 +15,10 @@ function readStored(key: string, fallback: number): number {
 // visible at the same time. It shows the same server-side session as the
 // /terminal route — this is a second view of one shell, not a second shell.
 export default function TerminalPanel() {
+  // Closed until asked for: the app view is the point of the page, and the shell
+  // is a tool you reach for. Once toggled, the choice sticks across pages/reloads.
   const [open, setOpen] = useState(
-    () => (localStorage.getItem(OPEN_KEY) ?? "1") === "1",
+    () => (localStorage.getItem(OPEN_KEY) ?? "0") === "1",
   );
   const [height, setHeight] = useState(() => readStored(HEIGHT_KEY, DEFAULT_HEIGHT));
   const drag = useRef<{ y: number; h: number } | null>(null);
