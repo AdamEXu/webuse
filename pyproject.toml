@@ -5,11 +5,11 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "fastapi>=0.139.0",
-    "pyobjc-framework-applicationservices>=12.2.1",
-    "pyobjc-framework-quartz>=12.2.1",
-    "pyobjc-framework-screencapturekit>=12.2.1",
+    "fastapi>=0.162.7",
+    "pyobjc-framework-applicationservices>=13.0",
+    "pyobjc-framework-quartz>=13.0",
+    "pyobjc-framework-screencapturekit>=13.0",
     "pyte>=0.8.2",
-    "uvicorn>=0.51.0",
-    "websockets>=16.1",
+    "uvicorn>=0.54.0",
+    "websockets>=17.4",
 ]
