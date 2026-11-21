@@ -34,7 +34,7 @@ uv sync
 
 ## Run
 
-Build the web frontend once (and after any frontend change), then start the server:
+Build the web frontend once (and after any frontend change; needs Node `^20.19.0 || >=22.12.0`), then start the server:
 
 ```sh
 cd webuse/frontend && pnpm install && pnpm build && cd ../..
